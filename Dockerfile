@@ -28,4 +28,4 @@ COPY src/ ./src/
 RUN npm run build
 
 # Define the command to start the Functions Framework
-CMD exec functions-framework --target=httpHandler --port=8080
+CMD exec functions-framework --target=httpHandler --port=${PORT:-8080}
