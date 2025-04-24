@@ -1,8 +1,8 @@
 # Use Node.js LTS 
 FROM node:20-slim
 
-# Install git and build-essentials
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# Install git, build-essentials and security updates
+RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends \
     git \
     build-essential \
     python3 \
