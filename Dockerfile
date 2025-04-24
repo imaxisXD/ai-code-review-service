@@ -38,9 +38,9 @@ ENV NODE_ENV=production
 ENV NODE_PATH=/workspace
 ENV DEBUG=*
 
-# Create a startup script
-RUN echo '#!/bin/sh\nset -e\necho "Starting server with: functions-framework --target=httpHandler --port=${PORT:-8080}"\nexec functions-framework --target=httpHandler --port=${PORT:-8080}' > /workspace/start.sh && \
+# Create a startup script with more debugging
+RUN echo '#!/bin/sh\nset -e\necho "Current directory: $(pwd)"\necho "Directory contents: $(ls -la)"\necho "Node version: $(node -v)"\necho "Starting server with: functions-framework --target=httpHandler --port=${PORT:-8080} --host=0.0.0.0"\nexec functions-framework --target=httpHandler --port=${PORT:-8080} --host=0.0.0.0' > /workspace/start.sh && \
     chmod +x /workspace/start.sh
 
 # Define the command to start the Functions Framework
-CMD exec functions-framework --target=httpHandler --port=${PORT:-8080} 
+CMD ["/workspace/start.sh"] 
