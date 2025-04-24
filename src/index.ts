@@ -40,7 +40,7 @@ const fileProcessor = new FileProcessorService({ logger });
 /**
  * Main HTTP Handler for repository indexing
  */
-export const httpHandler = functions.http('httpHandler', async (req, res) => {
+exports.httpHandler = async (req: functions.Request, res: functions.Response) => {
   if (req.method !== 'POST') {
     return res.status(405).send('Method Not Allowed');
   }
@@ -149,7 +149,7 @@ export const httpHandler = functions.http('httpHandler', async (req, res) => {
   } else {
     res.status(500).json(processingResult || { status: 'Failed', error: 'Unknown error' });
   }
-});
+};
 
 /**
  * Determine which files to process and delete based on job type
