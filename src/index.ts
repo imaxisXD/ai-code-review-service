@@ -40,7 +40,7 @@ const fileProcessor = new FileProcessorService({ logger });
 /**
  * Main HTTP Handler for repository indexing
  */
-functions.http('httpHandler', async (req, res) => {
+export const httpHandler = functions.http('httpHandler', async (req, res) => {
   if (req.method !== 'POST') {
     return res.status(405).send('Method Not Allowed');
   }
