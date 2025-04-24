@@ -27,5 +27,12 @@ COPY src/ ./src/
 # Build TypeScript code
 RUN npm run build
 
+# Make sure dist directory is accessible from the root directory
+RUN ln -s /workspace/dist /dist
+
+# Set environment variables
+ENV NODE_ENV=production
+ENV NODE_PATH=/workspace
+
 # Define the command to start the Functions Framework
 CMD exec functions-framework --target=httpHandler --port=${PORT:-8080}
