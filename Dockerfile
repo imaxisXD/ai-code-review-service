@@ -33,6 +33,11 @@ RUN ln -s /workspace/dist /dist
 # Set environment variables
 ENV NODE_ENV=production
 ENV NODE_PATH=/workspace
+ENV DEBUG=*
+
+# Create a startup script
+RUN echo '#!/bin/sh\nset -e\necho "Starting server with: functions-framework --target=httpHandler --port=${PORT:-8080}"\nexec functions-framework --target=httpHandler --port=${PORT:-8080}' > /workspace/start.sh && \
+    chmod +x /workspace/start.sh
 
 # Define the command to start the Functions Framework
-CMD exec functions-framework --target=httpHandler --port=${PORT:-8080}
+CMD ["/workspace/start.sh"]
