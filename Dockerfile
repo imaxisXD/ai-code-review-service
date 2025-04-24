@@ -16,7 +16,10 @@ WORKDIR /workspace
 COPY package*.json ./
 
 # Install dependencies (including dev dependencies for build)
-RUN npm install
+RUN npm install --include=dev
+
+RUN npm install -g @google-cloud/functions-framework
+
 
 # Copy TypeScript configuration
 COPY tsconfig.json ./
@@ -40,4 +43,4 @@ RUN echo '#!/bin/sh\nset -e\necho "Starting server with: functions-framework --t
     chmod +x /workspace/start.sh
 
 # Define the command to start the Functions Framework
-CMD ["/workspace/start.sh"]
+CMD exec functions-framework --target=httpHandler --port=${PORT:-8080} 
