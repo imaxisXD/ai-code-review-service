@@ -173,13 +173,13 @@ async function determineChanges(
     const diffSummary = await gitService.getDiffSummary(repoGit, beforeSha, endSha);
     
     filesToDelete = diffSummary.files
-      .filter((f: { changes: string }) => f.changes === 'D' || f.changes === 'R')
-      .map((f: { file?: string; from?: string }) => f.file || f.from);
+      .map(f => typeof f.file === 'string' ? f.file : undefined)
+      .filter((file): file is string => file !== undefined);
 
     filesToProcess = diffSummary.files
-      .filter((f: { changes: string }) => ['A', 'M', 'R'].includes(f.changes))
-      .map((f: { file?: string; to?: string }) => f.file || f.to)
-      .map((relPath: string) => path.join(cloneDir, relPath));
+      .map(f => typeof f.file === 'string' ? f.file : undefined)
+      .filter((file): file is string => file !== undefined)
+      .map(relPath => path.join(cloneDir, relPath));
   } else {
     logger.info('No changes detected or missing SHAs for incremental indexing');
   }
