@@ -15,8 +15,8 @@ WORKDIR /workspace
 # Copy package.json and package-lock.json
 COPY package*.json ./
 
-# Install dependencies
-RUN npm install --production
+# Install dependencies (including dev dependencies for build)
+RUN npm install
 
 # Copy TypeScript configuration
 COPY tsconfig.json ./

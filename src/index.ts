@@ -2,8 +2,8 @@
 import * as functions from '@google-cloud/functions-framework';
 import path from 'path';
 import fs from 'fs/promises';
-import { ConvexHttpClient } from 'convex/browser';
-import { api } from './convex/_generated/api';
+// import { ConvexHttpClient } from 'convex/browser';
+// import { api } from './convex/_generated/api';
 import { GitService } from './services/git-service';
 import { EmbeddingService } from './services/embedding-service';
 import { FileProcessorService } from './services/file-processor-service';
@@ -30,7 +30,7 @@ const logger = new Logger({
 });
 
 // Initialize Convex Client
-const convex = new ConvexHttpClient(CONVEX_URL);
+// const convex = new ConvexHttpClient(CONVEX_URL);
 
 // Initialize services
 const gitService = new GitService({ logger, githubToken: GITHUB_TOKEN });
@@ -92,16 +92,16 @@ functions.http('httpHandler', async (req, res) => {
       cloneDir, 
       jobType, 
       beforeSha, 
-      headCommit
+      headCommit || ''
     );
 
     // Process deletions
     if (filesToDelete.length > 0) {
       logger.info(`Deleting embeddings`, { count: filesToDelete.length });
-      await convex.mutation(api.embeddings.deleteEmbeddingsByPathBatch, {
-        repositoryId: repoId,
-        filePaths: filesToDelete,
-      });
+    //   await convex.mutation(api.embeddings.deleteEmbeddingsByPathBatch, {
+    //     repositoryId: repoId,
+    //     filePaths: filesToDelete,
+    //   });
     }
 
     // Process files
@@ -109,16 +109,16 @@ functions.http('httpHandler', async (req, res) => {
       cloneDir, 
       filesToProcess, 
       repoId, 
-      headCommit
+      headCommit || ''
     );
 
     // Update last indexed SHA
     logger.info(`Updating last indexed commit`, { repoId, commitSha: headCommit });
-    await convex.mutation(api.repositories.updateLastIndexedCommit, {
-      repositoryId: repoId,
-      commitSha: headCommit,
-      status: 'Indexed',
-    });
+    // await convex.mutation(api.repositories.updateLastIndexedCommit, {
+    //   repositoryId: repoId,
+    //   commitSha: headCommit,
+    //   status: 'Indexed',
+    // });
 
     processingResult = { 
       status: 'Success', 
@@ -167,19 +167,19 @@ async function determineChanges(
   if (jobType === 'initial') {
     logger.info('Initial indexing - getting all files');
     const allFiles = await fileProcessor.getAllFilesRecursive(cloneDir);
-    filesToProcess = allFiles.filter(file => fileProcessor.shouldProcessFile(file));
+    filesToProcess = allFiles.filter((file: string) => fileProcessor.shouldProcessFile(file));
   } else if (beforeSha && endSha && beforeSha !== endSha) {
     logger.info(`Incremental indexing`, { fromSha: beforeSha, toSha: endSha });
     const diffSummary = await gitService.getDiffSummary(repoGit, beforeSha, endSha);
     
     filesToDelete = diffSummary.files
-      .filter(f => f.changes === 'D' || f.changes === 'R')
-      .map(f => f.file || f.from);
+      .filter((f: { changes: string }) => f.changes === 'D' || f.changes === 'R')
+      .map((f: { file?: string; from?: string }) => f.file || f.from);
 
     filesToProcess = diffSummary.files
-      .filter(f => ['A', 'M', 'R'].includes(f.changes))
-      .map(f => f.file || f.to)
-      .map(relPath => path.join(cloneDir, relPath));
+      .filter((f: { changes: string }) => ['A', 'M', 'R'].includes(f.changes))
+      .map((f: { file?: string; to?: string }) => f.file || f.to)
+      .map((relPath: string) => path.join(cloneDir, relPath));
   } else {
     logger.info('No changes detected or missing SHAs for incremental indexing');
   }
@@ -266,10 +266,10 @@ async function storeEmbedding(
     commitSha,
   };
 
-  await convex.mutation(api.embeddings.storeEmbedding, {
-    embedding,
-    metadata,
-  });
+//   await convex.mutation(api.embeddings.storeEmbedding, {
+//     embedding,
+//     metadata,
+//   });
 }
 
 /**
@@ -281,11 +281,11 @@ async function updateIndexingStatus(
   error?: string
 ): Promise<void> {
   try {
-    await convex.mutation(api.repositories.updateIndexingStatus, { 
-      repositoryId, 
-      status, 
-      error 
-    });
+    // await convex.mutation(api.repositories.updateIndexingStatus, { 
+    //   repositoryId, 
+    //   status, 
+    //   error 
+    // });
   } catch (dbError) {
     logger.error('Failed to update status in database', { 
       repositoryId, 
