@@ -1,13 +1,17 @@
 # Use Node.js LTS 
 FROM node:20-slim
 
-# Install git, build-essentials and security updates
+# Install git, build-essentials, ca-certificates and security updates
 RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends \
     git \
     build-essential \
     python3 \
+    ca-certificates \
  && apt-get clean \
  && rm -rf /var/lib/apt/lists/*
+
+# Update CA certificates
+RUN update-ca-certificates
 
 # Set the working directory
 WORKDIR /workspace
@@ -19,7 +23,6 @@ COPY package*.json ./
 RUN npm install --include=dev --legacy-peer-deps
 
 RUN npm install -g @google-cloud/functions-framework --legacy-peer-deps
-
 
 # Copy TypeScript configuration
 COPY tsconfig.json ./
