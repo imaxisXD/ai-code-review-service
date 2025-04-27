@@ -6,6 +6,7 @@ export interface IndexingJob {
   jobType: 'initial' | 'incremental';
   beforeSha?: string;
   afterSha?: string;
+  githubToken?: string; // User's GitHub token for accessing private repos
 }
 
 // Processing result
@@ -17,13 +18,39 @@ export interface ProcessingResult {
   error?: string;
 }
 
+// Chunk types supported by the parsing system
+export type ChunkType =
+  // Basic types
+  | 'code'
+  | 'comment'
+  | 'docs'
+  // Symbol types
+  | 'class'
+  | 'function'
+  | 'method'
+  | 'interface'
+  | 'type'
+  | 'struct'
+  | 'property'
+  | 'arrow_function'
+  | 'module'
+  | 'enum'
+  | 'component'
+  | 'trait'
+  // Import/require types
+  | 'import'
+  | 'require'
+  | 'using'
+  | 'namespace'
+  | 'use';
+
 // Embedding chunk
 export interface EmbeddingChunk {
   codeChunkText: string;
   startLine: number;
   endLine: number;
   language: string;
-  chunkType: 'code' | 'comment' | 'docs';
+  chunkType: ChunkType;
   symbolName: string | null;
 }
 
@@ -60,20 +87,20 @@ export interface ConvexApi {
         commitSha: string;
       };
     }) => Promise<string>;
-    
+
     deleteEmbeddingsByPathBatch: (args: {
       repositoryId: string;
       filePaths: string[];
     }) => Promise<number>;
   };
-  
+
   repositories: {
     updateLastIndexedCommit: (args: {
       repositoryId: string;
       commitSha: string;
       status: IndexingStatus;
     }) => Promise<void>;
-    
+
     updateIndexingStatus: (args: {
       repositoryId: string;
       status: IndexingStatus;

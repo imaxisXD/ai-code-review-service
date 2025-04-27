@@ -13,7 +13,7 @@ export class Logger {
     debug: 0,
     info: 1,
     warn: 2,
-    error: 3
+    error: 3,
   };
 
   constructor(options: LoggerOptions) {

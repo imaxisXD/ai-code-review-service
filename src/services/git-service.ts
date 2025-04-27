@@ -37,21 +37,21 @@ export class GitService {
    * Clone repository and return SimpleGit instance for the cloned repo
    */
   public async cloneRepository(
-    repoUrl: string, 
-    targetDir: string, 
+    repoUrl: string,
+    targetDir: string,
     options: string[] = []
   ): Promise<SimpleGit> {
     const authenticatedUrl = this.getAuthenticatedUrl(repoUrl);
     const git = this.getSimpleGit(process.cwd());
-    
-    this.logger.debug('Cloning repository', { 
-      repoUrl: repoUrl.replace(this.githubToken || '', '[REDACTED]'), 
+
+    this.logger.debug('Cloning repository', {
+      repoUrl: repoUrl.replace(this.githubToken || '', '[REDACTED]'),
       targetDir,
-      options
+      options,
     });
-    
+
     await git.clone(authenticatedUrl, targetDir, options);
-    
+
     // Return SimpleGit instance for the cloned repo
     return this.getSimpleGit(targetDir);
   }

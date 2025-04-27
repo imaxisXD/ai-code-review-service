@@ -9,15 +9,27 @@
         "dev": "concurrently \"npm run build:watch\" \"npm run start\"",
         "build:watch": "tsc --watch",
         "lint": "eslint . --ext .ts",
+        "format": "prettier --write \"src/**/*.ts\"",
+        "format:check": "prettier --check \"src/**/*.ts\"",
         "test": "jest"
     },
     "dependencies": {
         "@google-cloud/functions-framework": "^3.5.1",
         "@google-cloud/storage": "^7.0.0",
+        "@upstash/workflow": "^0.2.12",
         "axios": "^1.5.0",
-        "convex": "^1.0.0",
+        "convex": "^1.23.0",
         "openai": "^4.2.0",
-        "simple-git": "^3.19.1"
+        "simple-git": "^3.19.1",
+        "tree-sitter": "^0.22.4",
+        "tree-sitter-c-sharp": "^0.23.1",
+        "tree-sitter-go": "^0.23.4",
+        "tree-sitter-java": "^0.23.5",
+        "tree-sitter-javascript": "^0.23.1",
+        "tree-sitter-php": "^0.23.12",
+        "tree-sitter-python": "^0.23.6",
+        "tree-sitter-ruby": "^0.23.1",
+        "tree-sitter-typescript": "^0.23.2"
     },
     "devDependencies": {
         "@types/jest": "^29.5.4",
@@ -26,7 +38,10 @@
         "@typescript-eslint/parser": "^6.6.0",
         "concurrently": "^8.2.1",
         "eslint": "^8.48.0",
+        "eslint-config-prettier": "^10.1.2",
+        "eslint-plugin-prettier": "^5.2.6",
         "jest": "^29.6.4",
+        "prettier": "^3.5.3",
         "ts-jest": "^29.1.1",
         "typescript": "^5.2.2"
     },
