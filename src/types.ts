@@ -2,11 +2,9 @@
 // Indexing job types
 export interface IndexingJob {
   repoId: string;
-  repoUrl: string;
+  userId: string;
   jobType: 'initial' | 'incremental';
-  beforeSha?: string;
-  afterSha?: string;
-  githubToken?: string; // User's GitHub token for accessing private repos
+  serviceSecretKey: string;
 }
 
 // Processing result
@@ -55,7 +53,7 @@ export interface EmbeddingChunk {
 }
 
 // Indexing status
-export type IndexingStatus = 'Pending' | 'Processing' | 'Indexed' | 'Failed';
+export type IndexingStatus = 'pending' | 'started' | 'completed' | 'failed' | 'indexed';
 
 // Git diff file change type
 export type GitChangeType = 'A' | 'M' | 'D' | 'R';

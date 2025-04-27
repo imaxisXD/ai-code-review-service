@@ -1,9 +1,7 @@
-// src/index.ts - Main function handler
 import * as functions from '@google-cloud/functions-framework';
 import path from 'path';
 import fs from 'fs/promises';
 import { ConvexHttpClient } from 'convex/browser';
-// import { api } from './convex/_generated/api';
 import { GitService } from './services/git-service';
 import { EmbeddingService } from './services/embedding-service';
 import { FileProcessorService } from './services/file-processor-service';
@@ -11,10 +9,10 @@ import { Logger } from './utils/logger';
 
 // Types
 import { IndexingJob, ProcessingResult, EmbeddingChunk, IndexingStatus } from './types';
+import { api } from './convex/api';
 
 // Configuration
 const CONVEX_URL = process.env.CONVEX_URL as string;
-const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
 const LOG_LEVEL = process.env.LOG_LEVEL || 'info';
 
 // Initialize logger
@@ -23,10 +21,8 @@ const logger = new Logger({
   level: LOG_LEVEL,
 });
 
-// Initialize Convex Client
-const convex = new ConvexHttpClient(CONVEX_URL);
-logger.info('convex', convex);
 // Initialize services
+const convex = new ConvexHttpClient(CONVEX_URL);
 const embeddingService = new EmbeddingService({ logger });
 const fileProcessor = new FileProcessorService({ logger });
 
@@ -40,41 +36,49 @@ exports.httpHandler = async (req: functions.Request, res: functions.Response) =>
 
   // Parse job data
   const jobData = req.body as IndexingJob;
-  logger.info('Received indexing job', { repoId: jobData.repoId, jobType: jobData.jobType });
+  logger.info('Received indexing job', {
+    repoId: jobData.repoId,
+    jobType: jobData.jobType,
+  });
 
-  const { repoId, repoUrl, jobType, beforeSha, afterSha, githubToken } = jobData;
-  const cloneDir = `/tmp/repo-${repoId}-${Date.now()}`;
+  const { repoId, userId, serviceSecretKey, jobType } = jobData;
 
-  // Validate required fields
-  if (!repoId || !repoUrl) {
-    logger.error('Missing required fields', { repoId, repoUrl });
+  if (serviceSecretKey !== process.env.SERVICE_SECRET_KEY) {
+    logger.error('Invalid service secret key');
+    return res.status(401).json({
+      status: 'Failed',
+      error: 'Invalid service secret key',
+    });
+  }
+
+  if (!repoId) {
+    logger.error('Missing required fields', { repoId });
     return res.status(400).json({
       status: 'Failed',
-      error: 'Missing required fields: repoId and repoUrl are required',
+      error: 'Missing required fields: repoId is required',
     });
   }
 
-  // Check GitHub token if necessary
-  if (repoUrl.includes('github.com') && !githubToken && !GITHUB_TOKEN) {
-    logger.error('GitHub token not provided and not configured');
-    return res.status(500).json({
-      status: 'Failed',
-      error: 'GitHub token required for accessing GitHub repositories',
-    });
-  }
+  // Get repository details
+  const repo = await convex.query(api.repositories.getRepositoryWithStringId, {
+    repositoryId: repoId,
+    userId: userId,
+  });
 
-  // Use token from job data if provided, fall back to environment variable
-  const effectiveGithubToken = githubToken || GITHUB_TOKEN;
+  const cloneDir = `/tmp/repo-${repo.repositoryName}-${repo._id}-${Date.now()}`;
+
+  const effectiveGithubToken = repo.accessToken;
 
   let processingResult: ProcessingResult | null = null;
   let headCommit: string | null = null;
-
+  let beforeSha: string | undefined;
+  const cloneUrl = repo.cloneUrl;
   try {
     // Update status to Processing
-    await updateIndexingStatus(repoId, 'Processing');
+    await updateIndexingStatus(repoId, 'pending');
 
     // Clone repository
-    logger.info(`Cloning repository`, { repoUrl, cloneDir });
+    logger.info(`Cloning repository`, { cloneUrl, cloneDir });
     const cloneOptions = jobType === 'initial' ? ['--depth=1'] : [];
 
     // Initialize git service with the effective token
@@ -83,11 +87,25 @@ exports.httpHandler = async (req: functions.Request, res: functions.Response) =>
       githubToken: effectiveGithubToken,
     });
 
-    const repoGit = await gitServiceInstance.cloneRepository(repoUrl, cloneDir, cloneOptions);
+    const repoGit = await gitServiceInstance.cloneRepository(cloneUrl, cloneDir, cloneOptions);
 
     // Get head commit
     headCommit = await gitServiceInstance.getHeadCommit(repoGit);
     logger.info('Repository cloned', { headCommit });
+
+    // For incremental indexing, get the previous commit SHA
+    if (jobType !== 'initial') {
+      try {
+        // Get the previous commit SHA using git
+        beforeSha = await repoGit.raw(['rev-parse', 'HEAD~1']);
+        beforeSha = beforeSha.trim(); // Remove any whitespace
+        logger.info('Previous commit identified', { beforeSha });
+      } catch (error) {
+        logger.warn('Failed to get previous commit, treating as initial indexing', {
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
 
     // Determine files to process and delete
     const { filesToProcess, filesToDelete } = await determineChanges(
@@ -112,12 +130,15 @@ exports.httpHandler = async (req: functions.Request, res: functions.Response) =>
     const processedFiles = await processFiles(cloneDir, filesToProcess, repoId, headCommit || '');
 
     // Update last indexed SHA
-    logger.info(`Updating last indexed commit`, { repoId, commitSha: headCommit });
-    // await convex.mutation(api.repositories.updateLastIndexedCommit, {
-    //   repositoryId: repoId,
-    //   commitSha: headCommit,
-    //   status: 'Indexed',
-    // });
+    logger.info(`Updating last indexed commit`, {
+      repoId,
+      commitSha: headCommit,
+    });
+    await convex.mutation(api.repositories.updateLastIndexedCommit, {
+      repositoryId: repoId,
+      commitSha: headCommit,
+      status: 'indexed',
+    });
 
     processingResult = {
       status: 'Success',
@@ -135,7 +156,7 @@ exports.httpHandler = async (req: functions.Request, res: functions.Response) =>
     };
 
     // Update status to Failed
-    await updateIndexingStatus(repoId, 'Failed', errorMessage);
+    await updateIndexingStatus(repoId, 'failed', errorMessage);
   } finally {
     // Clean up cloned repository
     await cleanupRepository(cloneDir);
@@ -172,13 +193,13 @@ async function determineChanges(
     const diffSummary = await gitServiceInstance.getDiffSummary(repoGit, beforeSha, endSha);
 
     filesToDelete = diffSummary.files
-      .map(f => (typeof f.file === 'string' ? f.file : undefined))
+      .map((f) => (typeof f.file === 'string' ? f.file : undefined))
       .filter((file): file is string => file !== undefined);
 
     filesToProcess = diffSummary.files
-      .map(f => (typeof f.file === 'string' ? f.file : undefined))
+      .map((f) => (typeof f.file === 'string' ? f.file : undefined))
       .filter((file): file is string => file !== undefined)
-      .map(relPath => path.join(cloneDir, relPath));
+      .map((relPath) => path.join(cloneDir, relPath));
   } else {
     logger.info('No changes detected or missing SHAs for incremental indexing');
   }
@@ -209,7 +230,7 @@ async function processFiles(
   for (let i = 0; i < filesToProcess.length; i += BATCH_SIZE) {
     const batch = filesToProcess.slice(i, i + BATCH_SIZE);
     await Promise.all(
-      batch.map(async fullFilePath => {
+      batch.map(async (fullFilePath) => {
         try {
           // Check if file exists and is not a directory
           const stats = await fs.stat(fullFilePath).catch(() => null);
@@ -256,21 +277,18 @@ async function storeEmbedding(
   repositoryId: string,
   commitSha: string
 ): Promise<void> {
-  const metadata = {
-    repositoryId,
+  // Call the Convex mutation with the required arguments
+  await convex.mutation(api.embeddings.storeEmbedding, {
+    embedding,
+    repositoryId: repositoryId,
     filePath,
     startLine: chunk.startLine,
     endLine: chunk.endLine,
     language: chunk.language,
     chunkType: chunk.chunkType,
-    symbolName: chunk.symbolName,
+    symbolName: chunk.symbolName ?? undefined,
     commitSha,
-  };
-
-  // await convex.mutation(api.embeddings.storeEmbedding, {
-  //   embedding,
-  //   metadata,
-  // });
+  });
 }
 
 /**
@@ -282,13 +300,12 @@ async function updateIndexingStatus(
   error?: string
 ): Promise<void> {
   try {
-    // await convex.mutation(api.repositories.updateIndexingStatus, {
-    //   repositoryId,
-    //   status,
-    //   error
-    // });
+    await convex.mutation(api.repositories.updateIndexingStatus, {
+      repositoryId,
+      status,
+    });
   } catch (dbError) {
-    logger.error('Failed to update status in database', {
+    logger.error('Failed to update status in database' + error, {
       repositoryId,
       status,
       error: dbError instanceof Error ? dbError.message : String(dbError),
