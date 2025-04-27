@@ -7,32 +7,20 @@ import Parser from 'tree-sitter'; // Use native tree-sitter
 import type { SyntaxNode, Tree, Language, Query } from 'tree-sitter'; // Import types
 
 // Import language modules directly (Node.js bindings)
-// Using require for TS and PHP due to their export structure
+// Using require for TS due to its export structure
 import JavaScript from 'tree-sitter-javascript';
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const tsModule = require('tree-sitter-typescript');
 const TypeScript: Language = tsModule.typescript as Language;
 const TSX: Language = tsModule.tsx as Language;
-import Python from 'tree-sitter-python';
 import Java from 'tree-sitter-java';
-import Go from 'tree-sitter-go';
-import CSharp from 'tree-sitter-c-sharp';
-import Ruby from 'tree-sitter-ruby';
-// eslint-disable-next-line @typescript-eslint/no-var-requires
-const phpModule = require('tree-sitter-php');
-const PHP: Language = phpModule.php as Language; // Use the correct grammar object
 
 // Map of language IDs to their tree-sitter language modules
 const LANGUAGE_MODULES: Record<string, Language> = {
   javascript: JavaScript as Language,
   typescript: TypeScript, // Already asserted
   tsx: TSX, // Already asserted
-  python: Python as Language,
   java: Java as Language,
-  go: Go as Language,
-  csharp: CSharp as Language,
-  ruby: Ruby as Language,
-  php: PHP, // Already asserted
 };
 
 // Cache for compiled queries to improve performance
@@ -152,9 +140,6 @@ export class TreeSitterService {
       jsx: 'javascript',
       ts: 'typescript',
       tsx: 'tsx',
-      py: 'python',
-      rb: 'ruby',
-      cs: 'csharp',
     };
     return languageMap[languageId] || languageId;
   }
@@ -248,12 +233,7 @@ export class TreeSitterService {
       javascript: '(import_statement) @import',
       typescript: '(import_statement) @import',
       tsx: '(import_statement) @import',
-      python: '(import_statement) @import (import_from_statement) @import',
       java: '(import_declaration) @import',
-      go: '(import_declaration) @import (import_spec) @import',
-      csharp: '(using_directive) @import',
-      ruby: '((call method: (identifier) @method) @import (#match? @method "^(require|include|extend)$"))',
-      php: '(namespace_use_declaration) @import (namespace_definition) @namespace',
     };
     return importQueries[this.mapLanguageId(language)] || null;
   }
@@ -261,14 +241,8 @@ export class TreeSitterService {
   /**
    * Get the appropriate chunk type for imports
    */
-  private getImportChunkType(language: string): ChunkType {
-    const importTypeMap: Record<string, ChunkType> = {
-      csharp: 'using',
-      php: 'use',
-      ruby: 'require',
-      default: 'import',
-    };
-    return importTypeMap[this.mapLanguageId(language)] || importTypeMap.default;
+  private getImportChunkType(_language: string): ChunkType {
+    return 'import';
   }
 
   /**
@@ -358,28 +332,11 @@ export class TreeSitterService {
           )
         `;
 
-      case 'python':
+      case 'java':
         return `
-          (class_definition name: (identifier) @class)
-          (function_definition name: (identifier) @function)
-        `;
-
-      case 'go':
-        return `
-          (type_declaration (type_spec name: (type_identifier) @type))
-          (function_declaration name: (identifier) @function)
-          (method_declaration name: (field_identifier) @method)
-          (interface_type name: (type_identifier) @interface)
-          (struct_type name: (type_identifier) @class)
-        `;
-
-      case 'rust':
-        return `
-          (struct_item name: (type_identifier) @class)
-          (enum_item name: (type_identifier) @enum)
-          (trait_item name: (type_identifier) @interface)
-          (function_item name: (identifier) @function)
-          (impl_item name: (type_identifier) @class)
+          (class_declaration name: (identifier) @class)
+          (method_declaration name: (identifier) @method)
+          (interface_declaration name: (identifier) @interface)
         `;
 
       default:
