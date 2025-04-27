@@ -16,9 +16,9 @@ WORKDIR /workspace
 COPY package*.json ./
 
 # Install dependencies (including dev dependencies for build)
-RUN npm install --include=dev
+RUN npm install --include=dev --legacy-peer-deps
 
-RUN npm install -g @google-cloud/functions-framework
+RUN npm install -g @google-cloud/functions-framework --legacy-peer-deps
 
 
 # Copy TypeScript configuration
