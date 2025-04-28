@@ -1,6 +1,7 @@
 // src/services/git-service.ts
 import simpleGit, { SimpleGit } from 'simple-git';
 import { Logger } from '../utils/logger';
+import { execSync } from 'child_process';
 
 interface GitServiceOptions {
   logger: Logger;
@@ -21,7 +22,18 @@ export class GitService {
    */
   private getAuthenticatedUrl(repoUrl: string): string {
     if (repoUrl.includes('github.com') && this.githubToken) {
-      return repoUrl.replace('https://', `https://x-access-token:${this.githubToken}@`);
+      // Remove any trailing slashes from the URL
+      const cleanUrl = repoUrl.replace(/\/+$/, '');
+
+      // Make sure to use the correct format for GitHub authentication
+      const authUrl = cleanUrl.replace('https://', `https://oauth2:${this.githubToken}@`);
+
+      this.logger.debug('Using authenticated URL', {
+        originalUrl: repoUrl.replace(/\/+$/, ''),
+        authUrlMasked: authUrl.replace(this.githubToken, '[REDACTED]'),
+      });
+
+      return authUrl;
     }
     return repoUrl;
   }
@@ -30,6 +42,21 @@ export class GitService {
    * Initialize simple-git instance
    */
   public getSimpleGit(baseDir: string): SimpleGit {
+    // Add custom git configuration
+    try {
+      // Set Git to use HTTPS instead of Git protocol
+      execSync('git config --global url."https://".insteadOf git://', { stdio: 'ignore' });
+
+      // Increase HTTP buffer size to handle large repositories
+      execSync('git config --global http.postBuffer 1048576000', { stdio: 'ignore' });
+
+      // Set longer timeouts
+      execSync('git config --global http.lowSpeedLimit 1000', { stdio: 'ignore' });
+      execSync('git config --global http.lowSpeedTime 60', { stdio: 'ignore' });
+    } catch (error) {
+      this.logger.warn('Failed to set git config', { error: String(error) });
+    }
+
     return simpleGit({ baseDir, binary: 'git' });
   }
 
@@ -50,7 +77,16 @@ export class GitService {
       options,
     });
 
-    await git.clone(authenticatedUrl, targetDir, options);
+    try {
+      await git.clone(authenticatedUrl, targetDir, options);
+      this.logger.debug('Clone successful');
+    } catch (error) {
+      this.logger.error('Clone failed', {
+        error: String(error),
+        repoUrl: repoUrl.replace(this.githubToken || '', '[REDACTED]'),
+      });
+      throw error;
+    }
 
     // Return SimpleGit instance for the cloned repo
     return this.getSimpleGit(targetDir);

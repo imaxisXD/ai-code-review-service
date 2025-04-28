@@ -18,8 +18,8 @@ import Java from 'tree-sitter-java';
 // Map of language IDs to their tree-sitter language modules
 const LANGUAGE_MODULES: Record<string, Language> = {
   javascript: JavaScript as Language,
-  typescript: TypeScript, // Already asserted
-  tsx: TSX, // Already asserted
+  typescript: TypeScript,
+  tsx: TSX,
   java: Java as Language,
 };
 
@@ -170,8 +170,9 @@ export class TreeSitterService {
 
     if (!this.queryCache[cacheKey]) {
       try {
-        // Use type assertion as a workaround for the query method issue
-        this.queryCache[cacheKey] = (language as any).query(queryString);
+        // Create a new query using the language's query method
+        const query = new Parser.Query(language, queryString);
+        this.queryCache[cacheKey] = query;
       } catch (error) {
         this.logger.error('Failed to create query', { language: language.name, error });
         throw error;

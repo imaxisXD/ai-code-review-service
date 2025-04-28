@@ -13,6 +13,13 @@ RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-reco
 # Update CA certificates
 RUN update-ca-certificates
 
+# Configure git
+RUN git config --global credential.helper cache \
+    && git config --global http.postBuffer 1048576000 \
+    && git config --global http.lowSpeedLimit 1000 \
+    && git config --global http.lowSpeedTime 60 \
+    && git config --global url."https://".insteadOf git://
+
 # Set the working directory
 WORKDIR /workspace
 
