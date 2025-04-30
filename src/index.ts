@@ -193,13 +193,13 @@ async function determineChanges(
     const diffSummary = await gitServiceInstance.getDiffSummary(repoGit, beforeSha, endSha);
 
     filesToDelete = diffSummary.files
-      .map((f) => (typeof f.file === 'string' ? f.file : undefined))
+      .map(f => (typeof f.file === 'string' ? f.file : undefined))
       .filter((file): file is string => file !== undefined);
 
     filesToProcess = diffSummary.files
-      .map((f) => (typeof f.file === 'string' ? f.file : undefined))
+      .map(f => (typeof f.file === 'string' ? f.file : undefined))
       .filter((file): file is string => file !== undefined)
-      .map((relPath) => path.join(cloneDir, relPath));
+      .map(relPath => path.join(cloneDir, relPath));
   } else {
     logger.info('No changes detected or missing SHAs for incremental indexing');
   }
@@ -230,7 +230,7 @@ async function processFiles(
   for (let i = 0; i < filesToProcess.length; i += BATCH_SIZE) {
     const batch = filesToProcess.slice(i, i + BATCH_SIZE);
     await Promise.all(
-      batch.map(async (fullFilePath) => {
+      batch.map(async fullFilePath => {
         try {
           // Check if file exists and is not a directory
           const stats = await fs.stat(fullFilePath).catch(() => null);

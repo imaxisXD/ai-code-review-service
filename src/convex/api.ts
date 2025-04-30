@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/ban-types */
 import { FunctionReference, anyApi } from 'convex/server';
 import { GenericId as Id } from 'convex/values';
 

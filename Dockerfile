@@ -1,5 +1,5 @@
 # Use Node.js LTS 
-FROM node:20-slim
+FROM node:23-slim
 
 # Install git, build-essentials, ca-certificates and security updates
 RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends \
