@@ -1,47 +1,47 @@
 // src/services/git-service.ts
-import simpleGit, { SimpleGit } from 'simple-git';
-import { Logger } from '../utils/logger';
+import { simpleGit as createSimpleGit, SimpleGit } from 'simple-git';
+import { Logger } from '../utils/logger.js';
 import { execSync } from 'child_process';
 
-interface GitServiceOptions {
+interface GitOptions {
   logger: Logger;
   githubToken?: string;
 }
 
-export class GitService {
-  private logger: Logger;
-  private githubToken?: string;
+/**
+ * Get authenticated URL if necessary
+ */
+function getAuthenticatedUrl(repoUrl: string, githubToken?: string, logger?: Logger): string {
+  if (repoUrl.includes('github.com') && githubToken) {
+    // Remove any trailing slashes from the URL
+    const cleanUrl = repoUrl.replace(/\/+$/, '');
 
-  constructor(options: GitServiceOptions) {
-    this.logger = options.logger;
-    this.githubToken = options.githubToken;
-  }
+    // Make sure to use the correct format for GitHub authentication
+    const authUrl = cleanUrl.replace('https://', `https://oauth2:${githubToken}@`);
 
-  /**
-   * Get authenticated URL if necessary
-   */
-  private getAuthenticatedUrl(repoUrl: string): string {
-    if (repoUrl.includes('github.com') && this.githubToken) {
-      // Remove any trailing slashes from the URL
-      const cleanUrl = repoUrl.replace(/\/+$/, '');
-
-      // Make sure to use the correct format for GitHub authentication
-      const authUrl = cleanUrl.replace('https://', `https://oauth2:${this.githubToken}@`);
-
-      this.logger.debug('Using authenticated URL', {
+    if (logger) {
+      logger.debug('Using authenticated URL', {
         originalUrl: repoUrl.replace(/\/+$/, ''),
-        authUrlMasked: authUrl.replace(this.githubToken, '[REDACTED]'),
+        authUrlMasked: authUrl.replace(githubToken, '[REDACTED]'),
       });
-
-      return authUrl;
     }
-    return repoUrl;
+
+    return authUrl;
   }
+  return repoUrl;
+}
+
+/**
+ * Create git service functions
+ */
+export function createGitService(options: GitOptions) {
+  const logger = options.logger;
+  const githubToken = options.githubToken;
 
   /**
    * Initialize simple-git instance
    */
-  public getSimpleGit(baseDir: string): SimpleGit {
+  function getSimpleGit(baseDir: string): SimpleGit {
     // Add custom git configuration
     try {
       // Set Git to use HTTPS instead of Git protocol
@@ -54,48 +54,48 @@ export class GitService {
       execSync('git config --global http.lowSpeedLimit 1000', { stdio: 'ignore' });
       execSync('git config --global http.lowSpeedTime 60', { stdio: 'ignore' });
     } catch (error) {
-      this.logger.warn('Failed to set git config', { error: String(error) });
+      logger.warn('Failed to set git config', { error: String(error) });
     }
 
-    return simpleGit({ baseDir, binary: 'git' });
+    return createSimpleGit({ baseDir, binary: 'git' });
   }
 
   /**
    * Clone repository and return SimpleGit instance for the cloned repo
    */
-  public async cloneRepository(
+  async function cloneRepository(
     repoUrl: string,
     targetDir: string,
     options: string[] = []
   ): Promise<SimpleGit> {
-    const authenticatedUrl = this.getAuthenticatedUrl(repoUrl);
-    const git = this.getSimpleGit(process.cwd());
+    const authenticatedUrl = getAuthenticatedUrl(repoUrl, githubToken, logger);
+    const git = getSimpleGit(process.cwd());
 
-    this.logger.debug('Cloning repository', {
-      repoUrl: repoUrl.replace(this.githubToken || '', '[REDACTED]'),
+    logger.debug('Cloning repository', {
+      repoUrl: repoUrl.replace(githubToken || '', '[REDACTED]'),
       targetDir,
       options,
     });
 
     try {
       await git.clone(authenticatedUrl, targetDir, options);
-      this.logger.debug('Clone successful');
+      logger.debug('Clone successful');
     } catch (error) {
-      this.logger.error('Clone failed', {
+      logger.error('Clone failed', {
         error: String(error),
-        repoUrl: repoUrl.replace(this.githubToken || '', '[REDACTED]'),
+        repoUrl: repoUrl.replace(githubToken || '', '[REDACTED]'),
       });
       throw error;
     }
 
     // Return SimpleGit instance for the cloned repo
-    return this.getSimpleGit(targetDir);
+    return getSimpleGit(targetDir);
   }
 
   /**
    * Get HEAD commit of a repository
    */
-  public async getHeadCommit(git: SimpleGit): Promise<string> {
+  async function getHeadCommit(git: SimpleGit): Promise<string> {
     const result = await git.revparse(['HEAD']);
     return result.trim();
   }
@@ -103,23 +103,32 @@ export class GitService {
   /**
    * Get diff summary between two commits
    */
-  public async getDiffSummary(git: SimpleGit, fromSha: string, toSha: string) {
-    this.logger.debug('Getting diff summary', { fromSha, toSha });
+  async function getDiffSummary(git: SimpleGit, fromSha: string, toSha: string) {
+    logger.debug('Getting diff summary', { fromSha, toSha });
     return await git.diffSummary([`${fromSha}..${toSha}`]);
   }
 
   /**
    * Get branches of a repository
    */
-  public async getBranches(git: SimpleGit) {
+  async function getBranches(git: SimpleGit) {
     return await git.branch();
   }
 
   /**
    * Checkout specific branch or commit
    */
-  public async checkout(git: SimpleGit, ref: string) {
-    this.logger.debug('Checking out ref', { ref });
+  async function checkout(git: SimpleGit, ref: string) {
+    logger.debug('Checking out ref', { ref });
     return await git.checkout(ref);
   }
+
+  return {
+    getSimpleGit,
+    cloneRepository,
+    getHeadCommit,
+    getDiffSummary,
+    getBranches,
+    checkout,
+  };
 }

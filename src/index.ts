@@ -1,62 +1,98 @@
-import * as functions from '@google-cloud/functions-framework';
+import { Hono } from 'hono';
+import { env } from 'hono/adapter';
+import { Logger } from './utils/logger.js';
+import { createAuthMiddleware } from './middleware/auth.js';
+import { createLoggerMiddleware } from './middleware/logger.js';
+import { createErrorHandler } from './middleware/error-handler.js';
+import { serve } from '@hono/node-server';
+import OpenAI from 'openai';
 import path from 'path';
 import fs from 'fs/promises';
+import { IndexingJob, IndexingStatus, EmbeddingChunk } from './types.js';
 import { ConvexHttpClient } from 'convex/browser';
-import { GitService } from './services/git-service';
-import { EmbeddingService } from './services/embedding-service';
-import { FileProcessorService } from './services/file-processor-service';
-import { Logger } from './utils/logger';
+import { api } from './convex/api.js';
+import { createGitService } from './services/git-service.js';
+import { createTreeSitterService } from './services/tree-sitter-service.js';
+import { SimpleGit } from 'simple-git';
 
-// Types
-import { IndexingJob, ProcessingResult, EmbeddingChunk, IndexingStatus } from './types';
-import { api } from './convex/api';
-
-// Configuration
-const CONVEX_URL = process.env.CONVEX_URL as string;
-const LOG_LEVEL = process.env.LOG_LEVEL || 'info';
+// Define environment type
+type AppEnv = {
+  OPENAI_API_KEY: string;
+  CONVEX_URL: string;
+  SERVICE_SECRET_KEY: string;
+  LOG_LEVEL?: string;
+  NODE_ENV?: string;
+  PORT?: string;
+};
 
 // Initialize logger
 const logger = new Logger({
   service: 'indexing-worker',
-  level: LOG_LEVEL,
 });
 
-// Initialize services
-const convex = new ConvexHttpClient(CONVEX_URL);
-const embeddingService = new EmbeddingService({ logger });
-const fileProcessor = new FileProcessorService({ logger });
+// Create application with environment variables
+const app = new Hono<{ Variables: { env: AppEnv; requestBody?: IndexingJob } }>();
 
-/**
- * Main HTTP Handler for repository indexing
- */
-exports.httpHandler = async (req: functions.Request, res: functions.Response) => {
-  if (req.method !== 'POST') {
-    return res.status(405).send('Method Not Allowed');
+// Add error handling middleware
+app.use('*', createErrorHandler(logger));
+
+// Add logger middleware
+app.use('*', createLoggerMiddleware(logger));
+
+// Health check endpoint
+app.get('/health', (c) => {
+  return c.json({
+    status: 'ok',
+  });
+});
+
+// Create a nested router for indexing
+const indexingRouter = new Hono<{ Variables: { env: AppEnv; requestBody?: IndexingJob } }>();
+
+// Apply auth middleware to protected routes
+indexingRouter.post('/', createAuthMiddleware(logger), async (c) => {
+  // Get environment variables from context
+  const { CONVEX_URL, OPENAI_API_KEY } = env<AppEnv>(c, 'node');
+
+  // Initialize Convex client
+  const convex = new ConvexHttpClient(CONVEX_URL);
+
+  // Initialize TreeSitter service
+  const treeSitterService = createTreeSitterService({ logger });
+
+  // Initialize OpenAI client
+  const openai = new OpenAI({
+    apiKey: OPENAI_API_KEY,
+  });
+
+  // Get the pre-validated request body from the auth middleware
+  const jobData = c.get('requestBody');
+  if (!jobData) {
+    return c.json(
+      {
+        status: 'Failed',
+        error: 'Missing request body',
+      },
+      400
+    );
   }
 
-  // Parse job data
-  const jobData = req.body as IndexingJob;
-  logger.info('Received indexing job', {
+  logger.info('Processing indexing job', {
     repoId: jobData.repoId,
     jobType: jobData.jobType,
   });
 
-  const { repoId, userId, serviceSecretKey, jobType } = jobData;
-
-  if (serviceSecretKey !== process.env.SERVICE_SECRET_KEY) {
-    logger.error('Invalid service secret key');
-    return res.status(401).json({
-      status: 'Failed',
-      error: 'Invalid service secret key',
-    });
-  }
+  const { repoId, userId, jobType } = jobData;
 
   if (!repoId) {
     logger.error('Missing required fields', { repoId });
-    return res.status(400).json({
-      status: 'Failed',
-      error: 'Missing required fields: repoId is required',
-    });
+    return c.json(
+      {
+        status: 'Failed',
+        error: 'Missing required fields: repoId is required',
+      },
+      400
+    );
   }
 
   // Get repository details
@@ -66,31 +102,30 @@ exports.httpHandler = async (req: functions.Request, res: functions.Response) =>
   });
 
   const cloneDir = `/tmp/repo-${repo.repositoryName}-${repo._id}-${Date.now()}`;
-
   const effectiveGithubToken = repo.accessToken;
-
-  let processingResult: ProcessingResult | null = null;
-  let headCommit: string | null = null;
-  let beforeSha: string | undefined;
+  let processingResult = null;
+  let headCommit = null;
+  let beforeSha;
   const cloneUrl = repo.cloneUrl;
+
   try {
     // Update status to Processing
-    await updateIndexingStatus(repoId, 'pending');
+    await updateIndexingStatus(convex, repoId, 'pending');
 
     // Clone repository
     logger.info(`Cloning repository`, { cloneUrl, cloneDir });
     const cloneOptions = jobType === 'initial' ? ['--depth=1'] : [];
 
     // Initialize git service with the effective token
-    const gitServiceInstance = new GitService({
+    const gitService = createGitService({
       logger,
       githubToken: effectiveGithubToken,
     });
 
-    const repoGit = await gitServiceInstance.cloneRepository(cloneUrl, cloneDir, cloneOptions);
+    const repoGit = await gitService.cloneRepository(cloneUrl, cloneDir, cloneOptions);
 
     // Get head commit
-    headCommit = await gitServiceInstance.getHeadCommit(repoGit);
+    headCommit = await gitService.getHeadCommit(repoGit);
     logger.info('Repository cloned', { headCommit });
 
     // For incremental indexing, get the previous commit SHA
@@ -112,9 +147,9 @@ exports.httpHandler = async (req: functions.Request, res: functions.Response) =>
       repoGit,
       cloneDir,
       jobType,
-      beforeSha,
+      beforeSha || '',
       headCommit || '',
-      gitServiceInstance
+      gitService
     );
 
     // Process deletions
@@ -127,7 +162,15 @@ exports.httpHandler = async (req: functions.Request, res: functions.Response) =>
     }
 
     // Process files
-    const processedFiles = await processFiles(cloneDir, filesToProcess, repoId, headCommit || '');
+    const processedFiles = await processFiles(
+      cloneDir,
+      filesToProcess,
+      repoId,
+      headCommit || '',
+      openai,
+      treeSitterService,
+      convex
+    );
 
     // Update last indexed SHA
     logger.info(`Updating last indexed commit`, {
@@ -156,7 +199,7 @@ exports.httpHandler = async (req: functions.Request, res: functions.Response) =>
     };
 
     // Update status to Failed
-    await updateIndexingStatus(repoId, 'failed', errorMessage);
+    await updateIndexingStatus(convex, repoId, 'failed', errorMessage);
   } finally {
     // Clean up cloned repository
     await cleanupRepository(cloneDir);
@@ -164,42 +207,123 @@ exports.httpHandler = async (req: functions.Request, res: functions.Response) =>
 
   // Send response
   if (processingResult?.status === 'Success') {
-    res.status(200).json(processingResult);
+    return c.json(processingResult, 200);
   } else {
-    res.status(500).json(processingResult || { status: 'Failed', error: 'Unknown error' });
+    return c.json(processingResult || { status: 'Failed', error: 'Unknown error' }, 500);
   }
-};
+});
 
-/**
- * Determine which files to process and delete based on job type
- */
+// File-related helper functions (moved directly into the handler)
+async function getAllFilesRecursive(dir: string): Promise<string[]> {
+  const dirents = await fs.readdir(dir, { withFileTypes: true });
+  const files = await Promise.all(
+    dirents.map((dirent) => {
+      const res = path.resolve(dir, dirent.name);
+      return dirent.isDirectory() ? getAllFilesRecursive(res) : res;
+    })
+  );
+  return files.flat();
+}
+
+const IGNORE_EXTENSIONS = [
+  '.jpg',
+  '.jpeg',
+  '.png',
+  '.gif',
+  '.bmp',
+  '.tiff',
+  '.ico',
+  '.svg',
+  '.mp3',
+  '.mp4',
+  '.avi',
+  '.mov',
+  '.wmv',
+  '.flv',
+  '.ogg',
+  '.wav',
+  '.zip',
+  '.tar',
+  '.gz',
+  '.rar',
+  '.7z',
+  '.pdf',
+  '.doc',
+  '.docx',
+  '.xls',
+  '.xlsx',
+  '.ppt',
+  '.pptx',
+  '.exe',
+  '.dll',
+  '.so',
+  '.o',
+  '.obj',
+  '.class',
+];
+
+const IGNORE_DIRS = [
+  'node_modules',
+  '.git',
+  'dist',
+  'build',
+  'target',
+  '.next',
+  '.vercel',
+  '.github',
+  '.vscode',
+  'coverage',
+  '.cache',
+];
+
+function shouldProcessFile(filePath: string): boolean {
+  // Skip files with ignored extensions
+  const extension = path.extname(filePath).toLowerCase();
+  if (IGNORE_EXTENSIONS.includes(extension)) {
+    return false;
+  }
+
+  // Skip files in ignored directories
+  const pathParts = filePath.split(path.sep);
+  for (const dir of IGNORE_DIRS) {
+    if (pathParts.includes(dir)) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+// Function to determine changes
 async function determineChanges(
-  repoGit: ReturnType<typeof GitService.prototype.getSimpleGit>,
+  repoGit: SimpleGit,
   cloneDir: string,
   jobType: string,
-  beforeSha: string | undefined,
+  beforeSha: string,
   endSha: string,
-  gitServiceInstance: GitService
+  gitService: ReturnType<typeof createGitService>
 ): Promise<{ filesToProcess: string[]; filesToDelete: string[] }> {
   let filesToProcess: string[] = [];
   let filesToDelete: string[] = [];
 
   if (jobType === 'initial') {
     logger.info('Initial indexing - getting all files');
-    const allFiles = await fileProcessor.getAllFilesRecursive(cloneDir);
-    filesToProcess = allFiles.filter((file: string) => fileProcessor.shouldProcessFile(file));
+    const allFiles = await getAllFilesRecursive(cloneDir);
+    filesToProcess = allFiles.filter((file: string) => shouldProcessFile(file));
   } else if (beforeSha && endSha && beforeSha !== endSha) {
     logger.info(`Incremental indexing`, { fromSha: beforeSha, toSha: endSha });
-    const diffSummary = await gitServiceInstance.getDiffSummary(repoGit, beforeSha, endSha);
+    const diffSummary = await gitService.getDiffSummary(repoGit, beforeSha, endSha);
 
     filesToDelete = diffSummary.files
-      .map(f => (typeof f.file === 'string' ? f.file : undefined))
+      .map((f) => (typeof f.file === 'string' ? f.file : undefined))
       .filter((file): file is string => file !== undefined);
 
     filesToProcess = diffSummary.files
-      .map(f => (typeof f.file === 'string' ? f.file : undefined))
+      .map((f) => {
+        return typeof f.file === 'string' ? f.file : undefined;
+      })
       .filter((file): file is string => file !== undefined)
-      .map(relPath => path.join(cloneDir, relPath));
+      .map((relPath: string) => path.join(cloneDir, relPath));
   } else {
     logger.info('No changes detected or missing SHAs for incremental indexing');
   }
@@ -212,16 +336,64 @@ async function determineChanges(
   return { filesToProcess, filesToDelete };
 }
 
-/**
- * Process files and generate embeddings
- */
+// Function for embedding generation with retry logic
+async function generateEmbedding(text: string, openai: OpenAI): Promise<number[]> {
+  // Truncate text to avoid token limits
+  // OpenAI's text-embedding-3-small has an 8191 token limit
+  // A very rough approximation is ~4 chars per token
+  const MAX_CHARS = 8000 * 4;
+  const truncatedText = text.length <= MAX_CHARS ? text : text.slice(0, MAX_CHARS);
+
+  const MAX_RETRIES = 3;
+  const RETRY_DELAY_MS = 1000;
+
+  let lastError: Error | null = null;
+
+  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+    try {
+      logger.debug('Generating embedding', {
+        attempt,
+        textLength: truncatedText.length,
+      });
+
+      const response = await openai.embeddings.create({
+        model: 'text-embedding-3-small',
+        input: truncatedText,
+      });
+
+      return response.data[0].embedding;
+    } catch (error) {
+      lastError = error instanceof Error ? error : new Error(String(error));
+
+      logger.warn('Embedding generation failed', {
+        attempt,
+        error: lastError.message,
+      });
+
+      if (attempt < MAX_RETRIES) {
+        // Add exponential backoff
+        const delay = RETRY_DELAY_MS * Math.pow(2, attempt - 1);
+        logger.debug(`Retrying after delay`, { delay });
+        await new Promise((resolve) => setTimeout(resolve, delay));
+      }
+    }
+  }
+
+  throw lastError || new Error('Failed to generate embedding after retries');
+}
+
+// Function to process files and generate embeddings
 async function processFiles(
   cloneDir: string,
   filesToProcess: string[],
   repoId: string,
-  commitSha: string
+  commitSha: string,
+  openai: OpenAI,
+  treeSitterService: ReturnType<typeof createTreeSitterService>,
+  convex: ConvexHttpClient
 ): Promise<string[]> {
   const processedFiles: string[] = [];
+  const MAX_FILE_SIZE = 1024 * 1024; // 1MB
 
   logger.info(`Processing files`, { count: filesToProcess.length });
 
@@ -230,25 +402,37 @@ async function processFiles(
   for (let i = 0; i < filesToProcess.length; i += BATCH_SIZE) {
     const batch = filesToProcess.slice(i, i + BATCH_SIZE);
     await Promise.all(
-      batch.map(async fullFilePath => {
+      batch.map(async (fullFilePath) => {
         try {
-          // Check if file exists and is not a directory
+          // Check file size
           const stats = await fs.stat(fullFilePath).catch(() => null);
-          if (!stats || !stats.isFile()) return;
+          if (!stats || !stats.isFile() || stats.size > MAX_FILE_SIZE) {
+            if (stats && stats.size > MAX_FILE_SIZE) {
+              logger.debug(`Skipping large file`, { filePath: fullFilePath, size: stats.size });
+            }
+            return;
+          }
 
+          // Read file content
+          const content = await fs.readFile(fullFilePath, 'utf8');
+
+          // Get file extension and determine language
           const relativePath = path.relative(cloneDir, fullFilePath);
+          const extension = path.extname(relativePath).toLowerCase().slice(1);
+          const language = extension || 'txt';
+
           logger.info(`Processing file`, { path: relativePath });
 
-          // Parse file into chunks
-          const chunks = await fileProcessor.parseAndChunkFile(fullFilePath);
+          // Parse file into chunks using TreeSitter
+          const chunks = treeSitterService.parseCodeToChunks(content, language, fullFilePath);
 
           // Process each chunk
           for (const chunk of chunks) {
             // Generate embedding
-            const embedding = await embeddingService.generateEmbedding(chunk.codeChunkText);
+            const embedding = await generateEmbedding(chunk.codeChunkText, openai);
 
             // Store embedding
-            await storeEmbedding(chunk, embedding, relativePath, repoId, commitSha);
+            await storeEmbedding(chunk, embedding, relativePath, repoId, commitSha, convex);
           }
 
           processedFiles.push(relativePath);
@@ -267,15 +451,14 @@ async function processFiles(
   return processedFiles;
 }
 
-/**
- * Store embedding in Convex database
- */
+// Function to store embedding in Convex database
 async function storeEmbedding(
   chunk: EmbeddingChunk,
   embedding: number[],
   filePath: string,
   repositoryId: string,
-  commitSha: string
+  commitSha: string,
+  convex: ConvexHttpClient
 ): Promise<void> {
   // Call the Convex mutation with the required arguments
   await convex.mutation(api.embeddings.storeEmbedding, {
@@ -291,10 +474,9 @@ async function storeEmbedding(
   });
 }
 
-/**
- * Update indexing status in database
- */
+// Function to update indexing status in database
 async function updateIndexingStatus(
+  convex: ConvexHttpClient,
   repositoryId: string,
   status: IndexingStatus,
   error?: string
@@ -313,9 +495,7 @@ async function updateIndexingStatus(
   }
 }
 
-/**
- * Clean up repository directory
- */
+// Function to clean up repository directory
 async function cleanupRepository(cloneDir: string): Promise<void> {
   logger.info(`Cleaning up repository`, { cloneDir });
   try {
@@ -333,3 +513,14 @@ async function cleanupRepository(cloneDir: string): Promise<void> {
     });
   }
 }
+
+// Mount the indexing router
+app.route('/', indexingRouter);
+
+// Method not allowed for other methods on root path
+app.all('/', (c) => c.text('Method Not Allowed', 405));
+
+serve({
+  fetch: app.fetch,
+  port: 8080,
+});
