@@ -1,5 +1,4 @@
 import { Hono } from 'hono';
-import { env } from 'hono/adapter';
 import { Logger } from './utils/logger.js';
 import { createAuthMiddleware } from './middleware/auth.js';
 import { createLoggerMiddleware } from './middleware/logger.js';
@@ -15,23 +14,51 @@ import { createGitService } from './services/git-service.js';
 import { createTreeSitterService } from './services/tree-sitter-service.js';
 import { SimpleGit } from 'simple-git';
 
-// Define environment type
-type AppEnv = {
-  OPENAI_API_KEY: string;
-  CONVEX_URL: string;
-  SERVICE_SECRET_KEY: string;
-  LOG_LEVEL?: string;
-  NODE_ENV?: string;
-  PORT?: string;
-};
+// --- Environment Variable Caching ---
+// Read environment variables once at startup
+const { OPENAI_API_KEY, CONVEX_URL, SERVICE_SECRET_KEY, LOG_LEVEL, PORT } = process.env;
+
+// Validate required environment variables
+if (!OPENAI_API_KEY) {
+  throw new Error('Missing required environment variable: OPENAI_API_KEY');
+}
+if (!CONVEX_URL) {
+  throw new Error('Missing required environment variable: CONVEX_URL');
+}
+if (!SERVICE_SECRET_KEY) {
+  throw new Error('Missing required environment variable: SERVICE_SECRET_KEY');
+}
+
+// --- Service Initialization ---
+// Define allowed log levels (adjust if your Logger uses different values)
+type LogLevel = 'debug' | 'info' | 'warn' | 'error';
+const allowedLogLevels: LogLevel[] = ['debug', 'info', 'warn', 'error'];
+
+// Validate and set log level
+const validatedLogLevel: LogLevel | undefined =
+  LOG_LEVEL && allowedLogLevels.includes(LOG_LEVEL.toLowerCase() as LogLevel)
+    ? (LOG_LEVEL.toLowerCase() as LogLevel)
+    : undefined; // Or set a default like 'info'
 
 // Initialize logger
 const logger = new Logger({
   service: 'indexing-worker',
+  level: validatedLogLevel, // Use validated level
 });
 
-// Create application with environment variables
-const app = new Hono<{ Variables: { env: AppEnv; requestBody?: IndexingJob } }>();
+// Initialize Convex client
+const convex = new ConvexHttpClient(CONVEX_URL);
+
+// Initialize OpenAI client
+const openai = new OpenAI({
+  apiKey: OPENAI_API_KEY,
+});
+
+// Initialize TreeSitter service
+const treeSitterService = createTreeSitterService({ logger });
+
+// Create application - Removed Env from Variables
+const app = new Hono<{ Variables: { requestBody?: IndexingJob } }>();
 
 // Add error handling middleware
 app.use('*', createErrorHandler(logger));
@@ -46,26 +73,11 @@ app.get('/health', (c) => {
   });
 });
 
-// Create a nested router for indexing
-const indexingRouter = new Hono<{ Variables: { env: AppEnv; requestBody?: IndexingJob } }>();
+// Create a nested router for indexing - Removed Env from Variables
+const indexingRouter = new Hono<{ Variables: { requestBody?: IndexingJob } }>();
 
-// Apply auth middleware to protected routes
-indexingRouter.post('/', createAuthMiddleware(logger), async (c) => {
-  // Get environment variables from context
-  const { CONVEX_URL, OPENAI_API_KEY } = env<AppEnv>(c, 'node');
-
-  // Initialize Convex client
-  const convex = new ConvexHttpClient(CONVEX_URL);
-
-  // Initialize TreeSitter service
-  const treeSitterService = createTreeSitterService({ logger });
-
-  // Initialize OpenAI client
-  const openai = new OpenAI({
-    apiKey: OPENAI_API_KEY,
-  });
-
-  // Get the pre-validated request body from the auth middleware
+// Apply auth middleware to protected routes - Pass cached secret key
+indexingRouter.post('/', createAuthMiddleware(logger, SERVICE_SECRET_KEY), async (c) => {
   const jobData = c.get('requestBody');
   if (!jobData) {
     return c.json(
@@ -390,7 +402,7 @@ async function processFiles(
   commitSha: string,
   openai: OpenAI,
   treeSitterService: ReturnType<typeof createTreeSitterService>,
-  convex: ConvexHttpClient
+  convexClient: ConvexHttpClient
 ): Promise<string[]> {
   const processedFiles: string[] = [];
   const MAX_FILE_SIZE = 1024 * 1024; // 1MB
@@ -428,11 +440,11 @@ async function processFiles(
 
           // Process each chunk
           for (const chunk of chunks) {
-            // Generate embedding
+            // Generate embedding (using pre-initialized openai client)
             const embedding = await generateEmbedding(chunk.codeChunkText, openai);
 
-            // Store embedding
-            await storeEmbedding(chunk, embedding, relativePath, repoId, commitSha, convex);
+            // Store embedding (using passed convex client)
+            await storeEmbedding(chunk, embedding, relativePath, repoId, commitSha, convexClient);
           }
 
           processedFiles.push(relativePath);
@@ -458,10 +470,10 @@ async function storeEmbedding(
   filePath: string,
   repositoryId: string,
   commitSha: string,
-  convex: ConvexHttpClient
+  convexClient: ConvexHttpClient
 ): Promise<void> {
   // Call the Convex mutation with the required arguments
-  await convex.mutation(api.embeddings.storeEmbedding, {
+  await convexClient.mutation(api.embeddings.storeEmbedding, {
     embedding,
     repositoryId: repositoryId,
     filePath,
@@ -476,13 +488,13 @@ async function storeEmbedding(
 
 // Function to update indexing status in database
 async function updateIndexingStatus(
-  convex: ConvexHttpClient,
+  convexClient: ConvexHttpClient,
   repositoryId: string,
   status: IndexingStatus,
   error?: string
 ): Promise<void> {
   try {
-    await convex.mutation(api.repositories.updateIndexingStatus, {
+    await convexClient.mutation(api.repositories.updateIndexingStatus, {
       repositoryId,
       status,
     });
@@ -522,5 +534,5 @@ app.all('/', (c) => c.text('Method Not Allowed', 405));
 
 serve({
   fetch: app.fetch,
-  port: 8080,
+  port: Number(PORT) || 8080,
 });
