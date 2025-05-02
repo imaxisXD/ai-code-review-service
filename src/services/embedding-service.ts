@@ -1,9 +1,8 @@
 // src/services/embedding-service.ts
 import OpenAI from 'openai';
-import { Logger } from '../utils/logger.js';
+import { logger } from '../utils/logger';
 
 interface EmbeddingOptions {
-  logger: Logger;
   openAIApiKey?: string;
   embeddingModel?: string;
 }
@@ -14,7 +13,7 @@ const RETRY_DELAY_MS = 1000;
 /**
  * Truncate text to avoid token limits
  */
-function truncateText(text: string, logger: Logger): string {
+function truncateText(text: string): string {
   // OpenAI's text-embedding-3-small has an 8191 token limit
   // A very rough approximation is ~4 chars per token
   const MAX_CHARS = 8000 * 4;
@@ -35,7 +34,6 @@ function truncateText(text: string, logger: Logger): string {
  * Create embedding service functions
  */
 export function createEmbeddingService(options: EmbeddingOptions) {
-  const logger = options.logger;
   const embeddingModel = options.embeddingModel || 'text-embedding-3-small';
 
   const openai = new OpenAI({
@@ -46,7 +44,7 @@ export function createEmbeddingService(options: EmbeddingOptions) {
    * Generate embedding for text with retry logic
    */
   async function generateEmbedding(text: string): Promise<number[]> {
-    const truncatedText = truncateText(text, logger);
+    const truncatedText = truncateText(text);
 
     let lastError: Error | null = null;
 

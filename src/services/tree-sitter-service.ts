@@ -1,4 +1,4 @@
-import { Logger } from '../utils/logger.js';
+import { logger } from '../utils/logger.js';
 import { EmbeddingChunk, ChunkType } from '../types.js';
 import Parser from 'tree-sitter'; // Use native tree-sitter
 import type { SyntaxNode, Tree, Language, Query } from 'tree-sitter'; // Import types
@@ -18,10 +18,6 @@ const LANGUAGE_MODULES: Record<string, Language> = {
 
 // Cache for compiled queries to improve performance
 type QueryCache = Record<string, Query>;
-
-interface TreeSitterOptions {
-  logger: Logger;
-}
 
 /**
  * Map language IDs to the keys used in LANGUAGE_MODULES
@@ -128,8 +124,7 @@ function mapCaptureToChunkType(captureName: string): ChunkType {
 /**
  * Create tree-sitter service functions
  */
-export function createTreeSitterService(options: TreeSitterOptions) {
-  const logger = options.logger;
+export function createTreeSitterService() {
   const parser = new Parser();
   const queryCache: QueryCache = {};
 

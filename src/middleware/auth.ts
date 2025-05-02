@@ -1,12 +1,9 @@
 import { MiddlewareHandler } from 'hono';
 import { createMiddleware } from 'hono/factory';
-import { Logger } from '../utils/logger.js';
+import { logger } from '../utils/logger.js';
 import { IndexingJob } from '../types.js';
 
-export const createAuthMiddleware = (
-  logger: Logger,
-  serviceSecretKeyEnv: string
-): MiddlewareHandler => {
+export const createAuthMiddleware = (serviceSecretKeyEnv: string): MiddlewareHandler => {
   return createMiddleware(async (c, next) => {
     try {
       const body = await c.req.json<IndexingJob>();

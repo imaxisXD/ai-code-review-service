@@ -1,17 +1,16 @@
 // src/services/git-service.ts
 import { simpleGit as createSimpleGit, SimpleGit } from 'simple-git';
-import { Logger } from '../utils/logger.js';
+import { logger } from '../utils/logger.js';
 import { execSync } from 'child_process';
 
 interface GitOptions {
-  logger: Logger;
   githubToken?: string;
 }
 
 /**
  * Get authenticated URL if necessary
  */
-function getAuthenticatedUrl(repoUrl: string, githubToken?: string, logger?: Logger): string {
+function getAuthenticatedUrl(repoUrl: string, githubToken?: string): string {
   if (repoUrl.includes('github.com') && githubToken) {
     // Remove any trailing slashes from the URL
     const cleanUrl = repoUrl.replace(/\/+$/, '');
@@ -19,12 +18,10 @@ function getAuthenticatedUrl(repoUrl: string, githubToken?: string, logger?: Log
     // Make sure to use the correct format for GitHub authentication
     const authUrl = cleanUrl.replace('https://', `https://oauth2:${githubToken}@`);
 
-    if (logger) {
-      logger.debug('Using authenticated URL', {
-        originalUrl: repoUrl.replace(/\/+$/, ''),
-        authUrlMasked: authUrl.replace(githubToken, '[REDACTED]'),
-      });
-    }
+    logger.debug('Using authenticated URL', {
+      originalUrl: repoUrl.replace(/\/+$/, ''),
+      authUrlMasked: authUrl.replace(githubToken, '[REDACTED]'),
+    });
 
     return authUrl;
   }
@@ -35,7 +32,6 @@ function getAuthenticatedUrl(repoUrl: string, githubToken?: string, logger?: Log
  * Create git service functions
  */
 export function createGitService(options: GitOptions) {
-  const logger = options.logger;
   const githubToken = options.githubToken;
 
   /**
@@ -68,7 +64,7 @@ export function createGitService(options: GitOptions) {
     targetDir: string,
     options: string[] = []
   ): Promise<SimpleGit> {
-    const authenticatedUrl = getAuthenticatedUrl(repoUrl, githubToken, logger);
+    const authenticatedUrl = getAuthenticatedUrl(repoUrl, githubToken);
     const git = getSimpleGit(process.cwd());
 
     logger.debug('Cloning repository', {

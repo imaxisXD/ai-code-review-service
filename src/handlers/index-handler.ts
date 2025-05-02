@@ -5,9 +5,9 @@ import fs from 'fs/promises';
 import { createGitService } from '../services/git-service.js';
 import { createEmbeddingService } from '../services/embedding-service.js';
 import { createFileProcessorService } from '../services/file-processor-service.js';
-import { Logger } from '../utils/logger.js';
 import { api } from '../convex/api.js';
 import { EmbeddingChunk, IndexingJob, IndexingStatus, ProcessingResult } from '../types.js';
+import { logger } from '../utils/logger.js';
 
 // Define ReturnType for each service
 type EmbeddingServiceType = ReturnType<typeof createEmbeddingService>;
@@ -16,7 +16,6 @@ type GitServiceType = ReturnType<typeof createGitService>;
 
 interface IndexHandlerOptions {
   convexUrl: string;
-  logger: Logger;
   embeddingService: EmbeddingServiceType;
   fileProcessor: FileProcessorServiceType;
   openAIApiKey: string;
@@ -27,7 +26,6 @@ interface IndexHandlerOptions {
  */
 export function createIndexHandler(options: IndexHandlerOptions) {
   const convex = new ConvexHttpClient(options.convexUrl);
-  const logger = options.logger;
   const embeddingService = options.embeddingService;
   const fileProcessor = options.fileProcessor;
   /**
@@ -77,7 +75,6 @@ export function createIndexHandler(options: IndexHandlerOptions) {
 
       // Initialize git service with the effective token
       const gitService = createGitService({
-        logger,
         githubToken: effectiveGithubToken,
       });
 

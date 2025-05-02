@@ -1,12 +1,12 @@
 import { MiddlewareHandler } from 'hono';
 import { createMiddleware } from 'hono/factory';
-import { Logger } from '../utils/logger.js';
+import { logger } from '../utils/logger';
 
 export interface ErrorWithStatus extends Error {
   status?: number;
 }
 
-export const createErrorHandler = (logger: Logger): MiddlewareHandler => {
+export const createErrorHandler = (): MiddlewareHandler => {
   return createMiddleware(async (c, next) => {
     try {
       await next();
