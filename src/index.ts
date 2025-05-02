@@ -1,62 +1,96 @@
-import * as functions from '@google-cloud/functions-framework';
-import path from 'path';
-import fs from 'fs/promises';
+import { Hono } from 'hono';
+import { createAuthMiddleware } from './middleware/auth.js';
+import { createLoggerMiddleware } from './middleware/logger.js';
+import { createErrorHandler } from './middleware/error-handler.js';
+import { serve } from '@hono/node-server';
+import OpenAI from 'openai';
+import { IndexingJob } from './types.js';
 import { ConvexHttpClient } from 'convex/browser';
-import { GitService } from './services/git-service';
-import { EmbeddingService } from './services/embedding-service';
-import { FileProcessorService } from './services/file-processor-service';
-import { Logger } from './utils/logger';
+import { api } from './convex/api.js';
+import { createGitService } from './services/git-service.js';
+import { createTreeSitterService } from './services/tree-sitter-service.js';
+import { determineChanges } from './helper/file-change.js';
+import { logger } from './utils/logger.js';
+import { cleanupRepository, updateIndexingStatus } from './helper/cleanup.js';
+import { processFiles } from './helper/file-functions.js';
 
-// Types
-import { IndexingJob, ProcessingResult, EmbeddingChunk, IndexingStatus } from './types';
-import { api } from './convex/api';
+// --- Environment Variable Caching ---
+// Read environment variables once at startup
+const { OPENAI_API_KEY, CONVEX_URL, SERVICE_SECRET_KEY, PORT, QSTASH_TOKEN } = process.env;
 
-// Configuration
-const CONVEX_URL = process.env.CONVEX_URL as string;
-const LOG_LEVEL = process.env.LOG_LEVEL || 'info';
+// Validate required environment variables
+if (!OPENAI_API_KEY) {
+  throw new Error('Missing required environment variable: OPENAI_API_KEY');
+}
+if (!CONVEX_URL) {
+  throw new Error('Missing required environment variable: CONVEX_URL');
+}
+if (!SERVICE_SECRET_KEY) {
+  throw new Error('Missing required environment variable: SERVICE_SECRET_KEY');
+}
+if (!QSTASH_TOKEN) {
+  throw new Error('Missing required environment variable: QSTASH_TOKEN');
+}
 
-// Initialize logger
-const logger = new Logger({
-  service: 'indexing-worker',
-  level: LOG_LEVEL,
+// Initialize Convex client
+const convex = new ConvexHttpClient(CONVEX_URL);
+
+// Initialize OpenAI client
+const openai = new OpenAI({
+  apiKey: OPENAI_API_KEY,
 });
 
-// Initialize services
-const convex = new ConvexHttpClient(CONVEX_URL);
-const embeddingService = new EmbeddingService({ logger });
-const fileProcessor = new FileProcessorService({ logger });
+// Initialize TreeSitter service
+const treeSitterService = createTreeSitterService();
 
-/**
- * Main HTTP Handler for repository indexing
- */
-exports.httpHandler = async (req: functions.Request, res: functions.Response) => {
-  if (req.method !== 'POST') {
-    return res.status(405).send('Method Not Allowed');
+// Create application - Removed Env from Variables
+const app = new Hono<{ Variables: { requestBody?: IndexingJob } }>();
+
+// Add error handling middleware
+app.use('*', createErrorHandler());
+
+// Add logger middleware
+app.use('*', createLoggerMiddleware());
+
+// Health check endpoint
+app.get('/health', (c) => {
+  return c.json({
+    status: 'ok',
+  });
+});
+
+// Create a nested router for indexing - Removed Env from Variables
+const indexingRouter = new Hono<{ Variables: { requestBody?: IndexingJob } }>();
+
+// Apply auth middleware to protected routes - Pass cached secret key
+indexingRouter.post('/', createAuthMiddleware(SERVICE_SECRET_KEY), async (c) => {
+  const jobData = c.get('requestBody');
+  if (!jobData) {
+    return c.json(
+      {
+        status: 'Failed',
+        error: 'Missing request body',
+      },
+      400
+    );
   }
 
-  // Parse job data
-  const jobData = req.body as IndexingJob;
-  logger.info('Received indexing job', {
+  logger.info('Processing indexing job', {
     repoId: jobData.repoId,
     jobType: jobData.jobType,
   });
 
-  const { repoId, userId, serviceSecretKey, jobType } = jobData;
-
-  if (serviceSecretKey !== process.env.SERVICE_SECRET_KEY) {
-    logger.error('Invalid service secret key');
-    return res.status(401).json({
-      status: 'Failed',
-      error: 'Invalid service secret key',
-    });
-  }
+  const { repoId, userId, jobType } = jobData;
 
   if (!repoId) {
     logger.error('Missing required fields', { repoId });
-    return res.status(400).json({
-      status: 'Failed',
-      error: 'Missing required fields: repoId is required',
-    });
+    return c.json(
+      {
+        status: 'Failed',
+        error: 'Missing required fields: repoId is required',
+      },
+      400
+    );
   }
 
   // Get repository details
@@ -66,31 +100,29 @@ exports.httpHandler = async (req: functions.Request, res: functions.Response) =>
   });
 
   const cloneDir = `/tmp/repo-${repo.repositoryName}-${repo._id}-${Date.now()}`;
-
   const effectiveGithubToken = repo.accessToken;
-
-  let processingResult: ProcessingResult | null = null;
-  let headCommit: string | null = null;
-  let beforeSha: string | undefined;
+  let processingResult = null;
+  let headCommit = null;
+  let beforeSha;
   const cloneUrl = repo.cloneUrl;
+
   try {
     // Update status to Processing
-    await updateIndexingStatus(repoId, 'pending');
+    await updateIndexingStatus(convex, repoId, 'pending');
 
     // Clone repository
     logger.info(`Cloning repository`, { cloneUrl, cloneDir });
     const cloneOptions = jobType === 'initial' ? ['--depth=1'] : [];
 
     // Initialize git service with the effective token
-    const gitServiceInstance = new GitService({
-      logger,
+    const gitService = createGitService({
       githubToken: effectiveGithubToken,
     });
 
-    const repoGit = await gitServiceInstance.cloneRepository(cloneUrl, cloneDir, cloneOptions);
+    const repoGit = await gitService.cloneRepository(cloneUrl, cloneDir, cloneOptions);
 
     // Get head commit
-    headCommit = await gitServiceInstance.getHeadCommit(repoGit);
+    headCommit = await gitService.getHeadCommit(repoGit);
     logger.info('Repository cloned', { headCommit });
 
     // For incremental indexing, get the previous commit SHA
@@ -112,9 +144,9 @@ exports.httpHandler = async (req: functions.Request, res: functions.Response) =>
       repoGit,
       cloneDir,
       jobType,
-      beforeSha,
+      beforeSha || '',
       headCommit || '',
-      gitServiceInstance
+      gitService
     );
 
     // Process deletions
@@ -127,7 +159,15 @@ exports.httpHandler = async (req: functions.Request, res: functions.Response) =>
     }
 
     // Process files
-    const processedFiles = await processFiles(cloneDir, filesToProcess, repoId, headCommit || '');
+    const processedFiles = await processFiles(
+      cloneDir,
+      filesToProcess,
+      repoId,
+      headCommit || '',
+      openai,
+      treeSitterService,
+      convex
+    );
 
     // Update last indexed SHA
     logger.info(`Updating last indexed commit`, {
@@ -156,7 +196,7 @@ exports.httpHandler = async (req: functions.Request, res: functions.Response) =>
     };
 
     // Update status to Failed
-    await updateIndexingStatus(repoId, 'failed', errorMessage);
+    await updateIndexingStatus(convex, repoId, 'failed', errorMessage);
   } finally {
     // Clean up cloned repository
     await cleanupRepository(cloneDir);
@@ -164,172 +204,19 @@ exports.httpHandler = async (req: functions.Request, res: functions.Response) =>
 
   // Send response
   if (processingResult?.status === 'Success') {
-    res.status(200).json(processingResult);
+    return c.json(processingResult, 200);
   } else {
-    res.status(500).json(processingResult || { status: 'Failed', error: 'Unknown error' });
+    return c.json(processingResult || { status: 'Failed', error: 'Unknown error' }, 500);
   }
-};
+});
 
-/**
- * Determine which files to process and delete based on job type
- */
-async function determineChanges(
-  repoGit: ReturnType<typeof GitService.prototype.getSimpleGit>,
-  cloneDir: string,
-  jobType: string,
-  beforeSha: string | undefined,
-  endSha: string,
-  gitServiceInstance: GitService
-): Promise<{ filesToProcess: string[]; filesToDelete: string[] }> {
-  let filesToProcess: string[] = [];
-  let filesToDelete: string[] = [];
+// Mount the indexing router
+app.route('/', indexingRouter);
 
-  if (jobType === 'initial') {
-    logger.info('Initial indexing - getting all files');
-    const allFiles = await fileProcessor.getAllFilesRecursive(cloneDir);
-    filesToProcess = allFiles.filter((file: string) => fileProcessor.shouldProcessFile(file));
-  } else if (beforeSha && endSha && beforeSha !== endSha) {
-    logger.info(`Incremental indexing`, { fromSha: beforeSha, toSha: endSha });
-    const diffSummary = await gitServiceInstance.getDiffSummary(repoGit, beforeSha, endSha);
+// Method not allowed for other methods on root path
+app.all('/', (c) => c.text('Method Not Allowed', 405));
 
-    filesToDelete = diffSummary.files
-      .map(f => (typeof f.file === 'string' ? f.file : undefined))
-      .filter((file): file is string => file !== undefined);
-
-    filesToProcess = diffSummary.files
-      .map(f => (typeof f.file === 'string' ? f.file : undefined))
-      .filter((file): file is string => file !== undefined)
-      .map(relPath => path.join(cloneDir, relPath));
-  } else {
-    logger.info('No changes detected or missing SHAs for incremental indexing');
-  }
-
-  logger.info('Changes determined', {
-    filesToProcess: filesToProcess.length,
-    filesToDelete: filesToDelete.length,
-  });
-
-  return { filesToProcess, filesToDelete };
-}
-
-/**
- * Process files and generate embeddings
- */
-async function processFiles(
-  cloneDir: string,
-  filesToProcess: string[],
-  repoId: string,
-  commitSha: string
-): Promise<string[]> {
-  const processedFiles: string[] = [];
-
-  logger.info(`Processing files`, { count: filesToProcess.length });
-
-  // Process in batches to avoid memory issues
-  const BATCH_SIZE = 20;
-  for (let i = 0; i < filesToProcess.length; i += BATCH_SIZE) {
-    const batch = filesToProcess.slice(i, i + BATCH_SIZE);
-    await Promise.all(
-      batch.map(async fullFilePath => {
-        try {
-          // Check if file exists and is not a directory
-          const stats = await fs.stat(fullFilePath).catch(() => null);
-          if (!stats || !stats.isFile()) return;
-
-          const relativePath = path.relative(cloneDir, fullFilePath);
-          logger.info(`Processing file`, { path: relativePath });
-
-          // Parse file into chunks
-          const chunks = await fileProcessor.parseAndChunkFile(fullFilePath);
-
-          // Process each chunk
-          for (const chunk of chunks) {
-            // Generate embedding
-            const embedding = await embeddingService.generateEmbedding(chunk.codeChunkText);
-
-            // Store embedding
-            await storeEmbedding(chunk, embedding, relativePath, repoId, commitSha);
-          }
-
-          processedFiles.push(relativePath);
-        } catch (error) {
-          const errorMessage = error instanceof Error ? error.message : String(error);
-          logger.error(`Failed to process file`, {
-            path: fullFilePath,
-            error: errorMessage,
-          });
-          // Continue with other files
-        }
-      })
-    );
-  }
-
-  return processedFiles;
-}
-
-/**
- * Store embedding in Convex database
- */
-async function storeEmbedding(
-  chunk: EmbeddingChunk,
-  embedding: number[],
-  filePath: string,
-  repositoryId: string,
-  commitSha: string
-): Promise<void> {
-  // Call the Convex mutation with the required arguments
-  await convex.mutation(api.embeddings.storeEmbedding, {
-    embedding,
-    repositoryId: repositoryId,
-    filePath,
-    startLine: chunk.startLine,
-    endLine: chunk.endLine,
-    language: chunk.language,
-    chunkType: chunk.chunkType,
-    symbolName: chunk.symbolName ?? undefined,
-    commitSha,
-  });
-}
-
-/**
- * Update indexing status in database
- */
-async function updateIndexingStatus(
-  repositoryId: string,
-  status: IndexingStatus,
-  error?: string
-): Promise<void> {
-  try {
-    await convex.mutation(api.repositories.updateIndexingStatus, {
-      repositoryId,
-      status,
-    });
-  } catch (dbError) {
-    logger.error('Failed to update status in database' + error, {
-      repositoryId,
-      status,
-      error: dbError instanceof Error ? dbError.message : String(dbError),
-    });
-  }
-}
-
-/**
- * Clean up repository directory
- */
-async function cleanupRepository(cloneDir: string): Promise<void> {
-  logger.info(`Cleaning up repository`, { cloneDir });
-  try {
-    await fs.access(cloneDir).then(
-      async () => {
-        await fs.rm(cloneDir, { recursive: true, force: true });
-        logger.info('Repository cleanup successful');
-      },
-      () => logger.info('No cleanup needed, directory does not exist')
-    );
-  } catch (cleanupError) {
-    logger.error('Repository cleanup failed', {
-      cloneDir,
-      error: cleanupError instanceof Error ? cleanupError.message : String(cleanupError),
-    });
-  }
-}
+serve({
+  fetch: app.fetch,
+  port: Number(PORT) || 8080,
+});
