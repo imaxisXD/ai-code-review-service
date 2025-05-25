@@ -1,7 +1,7 @@
 import { ConvexHttpClient } from 'convex/browser';
-import { api } from '../convex/api';
-import { IndexingStatus } from '../types';
-import { logger } from '../utils/logger';
+import { api } from '../convex/api.js';
+import { IndexingStatus } from '../types.js';
+import { logger } from '../utils/logger.js';
 import fs from 'fs/promises';
 
 // Function to update indexing status in database

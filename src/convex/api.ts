@@ -1,9 +1,8 @@
-/* eslint-disable @typescript-eslint/ban-types */
 import { FunctionReference, anyApi } from 'convex/server';
 import { GenericId as Id } from 'convex/values';
 
 export const api: PublicApiType = anyApi as unknown as PublicApiType;
-export const internal: InternalApiType = anyApi as unknown as InternalApiType;
+// export const internal: InternalApiType = anyApi as unknown as InternalApiType;
 
 export type PublicApiType = {
   repositories: {
@@ -222,9 +221,11 @@ export type PublicApiType = {
         endLine: number;
         filePath: string;
         language?: string;
+        metadata?: any;
         repositoryId: string;
         startLine: number;
         symbolName?: string;
+        text?: string;
       },
       Id<'codeChunks'>
     >;
@@ -239,14 +240,28 @@ export type PublicApiType = {
       },
       any
     >;
-    searchLegacyVectors: FunctionReference<
-      'action',
+    deleteEmbeddingsByPathBatch: FunctionReference<
+      'mutation',
+      'public',
+      { filePaths: Array<string>; repositoryId: string },
+      { deletedCount: number; message: string; success: boolean }
+    >;
+    storeCodeRelationship: FunctionReference<
+      'mutation',
       'public',
       {
-        embedding: Array<number>;
-        language?: string;
-        limit?: number;
-        repositoryId?: Id<'repositories'>;
+        commitSha: string;
+        metadata: { endLine: number; filePath: string; startLine: number };
+        relationshipType:
+          | 'function_call'
+          | 'import'
+          | 'inheritance'
+          | 'implementation'
+          | 'usage'
+          | 'composition';
+        repositoryId: string;
+        source: string;
+        target: string;
       },
       any
     >;
@@ -259,5 +274,30 @@ export type PublicApiType = {
       { message: string; success: boolean }
     >;
   };
+  llm: {
+    searchCode: FunctionReference<
+      'action',
+      'public',
+      {
+        language?: string;
+        limit?: number;
+        query: string;
+        repositoryId?: Id<'repositories'>;
+      },
+      any
+    >;
+    searchAndAnalyzeCode: FunctionReference<
+      'action',
+      'public',
+      {
+        language?: string;
+        limit?: number;
+        prompt?: string;
+        query: string;
+        repositoryId?: Id<'repositories'>;
+      },
+      any
+    >;
+  };
 };
-export type InternalApiType = {};
+// export type InternalApiType = {};

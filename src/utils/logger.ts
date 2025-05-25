@@ -28,11 +28,32 @@ function serializeLogData(data: LogDataValue | LogDataObject) {
 }
 
 function formatLog(level: string, message: string, data?: LogDataObject): string {
-  const timestamp = new Date().toISOString();
   const serviceStr = '[indexing-worker]';
-  const dataString = data ? JSON.stringify(data, (_, value) => serializeLogData(value)) : '';
 
-  return `${timestamp} [${level}] ${serviceStr} ${message} ${dataString}`;
+  let dataString = '';
+  if (data) {
+    try {
+      // Use a more robust approach to handle circular references
+      const cache = new Set();
+      dataString = JSON.stringify(data, (key, value) => {
+        if (typeof value === 'object' && value !== null) {
+          // Detect circular reference
+          if (cache.has(value)) {
+            return '[Circular Reference]';
+          }
+          cache.add(value);
+        }
+        return serializeLogData(value);
+      });
+    } catch (error) {
+      dataString = JSON.stringify({
+        error: 'Error stringifying log data',
+        message: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  return `[${level}] ${serviceStr} ${message} ${dataString}`;
 }
 
 export const logger = {

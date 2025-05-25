@@ -1,5 +1,5 @@
 import { logger } from '../utils/logger.js';
-import { EmbeddingChunk, ChunkType } from '../types.js';
+import { EmbeddingChunk, ChunkType, CodeRelationship, RelationshipType } from '../types.js';
 import Parser from 'tree-sitter'; // Use native tree-sitter
 import type { SyntaxNode, Tree, Language, Query } from 'tree-sitter'; // Import types
 import JavaScript from 'tree-sitter-javascript';
@@ -7,6 +7,8 @@ import tsModule from 'tree-sitter-typescript';
 const TypeScript: Language = tsModule.typescript as Language;
 const TSX: Language = tsModule.tsx as Language;
 import Java from 'tree-sitter-java';
+import JSON from 'tree-sitter-json';
+import path from 'path';
 
 // Map of language IDs to their tree-sitter language modules
 const LANGUAGE_MODULES: Record<string, Language> = {
@@ -14,6 +16,7 @@ const LANGUAGE_MODULES: Record<string, Language> = {
   typescript: TypeScript,
   tsx: TSX,
   java: Java as Language,
+  json: JSON as Language,
 };
 
 // Cache for compiled queries to improve performance
@@ -44,11 +47,12 @@ function getLanguageModule(languageId: string): Language | null {
  * Get the appropriate import query for a language
  */
 function getImportQuery(language: string): string | null {
-  const importQueries: Record<string, string> = {
+  const importQueries: Record<string, string | null> = {
     javascript: '(import_statement) @import',
     typescript: '(import_statement) @import',
     tsx: '(import_statement) @import',
     java: '(import_declaration) @import',
+    json: null, // JSON doesn't have imports
   };
   return importQueries[mapLanguageId(language)] || null;
 }
@@ -234,6 +238,10 @@ export function createTreeSitterService() {
         (method_declaration) @method
         (interface_declaration) @interface
         (enum_declaration) @enum
+      `,
+      json: `
+        (object) @object
+        (array) @array
       `,
     };
     return symbolQueries[mapLanguageId(language)] || null;
@@ -451,8 +459,370 @@ export function createTreeSitterService() {
     }
   }
 
+  /**
+   * Find all function calls in the AST
+   */
+  function findAllFunctionCalls(
+    rootNode: SyntaxNode,
+    code: string,
+    filePath: string,
+    language: string
+  ): Omit<CodeRelationship, 'type'>[] {
+    const functionCalls: Omit<CodeRelationship, 'type'>[] = [];
+    const functionCallQueries: Record<string, string | null> = {
+      javascript: `
+        (call_expression
+          function: [
+            (identifier) @callee
+            (member_expression
+              property: (property_identifier) @callee)
+          ]) @call
+      `,
+      typescript: `
+        (call_expression
+          function: [
+            (identifier) @callee
+            (member_expression
+              property: (property_identifier) @callee)
+          ]) @call
+      `,
+      tsx: `
+        (call_expression
+          function: [
+            (identifier) @callee
+            (member_expression
+              property: (property_identifier) @callee)
+          ]) @call
+      `,
+      java: `
+        (method_invocation
+          name: (identifier) @callee) @call
+      `,
+      json: null, // JSON doesn't have function calls
+    };
+
+    const mappedLang = mapLanguageId(language);
+    const queryString = functionCallQueries[mappedLang];
+    if (!queryString) return functionCalls;
+
+    try {
+      const langModule = LANGUAGE_MODULES[mappedLang];
+      if (!langModule) return functionCalls;
+
+      const query = getOrCreateQuery(langModule, queryString);
+      const captures = query.captures(rootNode);
+
+      // Group captures by call expression
+      const groupedCaptures = new Map<SyntaxNode, { callee?: string; call?: SyntaxNode }>();
+
+      for (const { node, name } of captures) {
+        if (name === 'call') {
+          if (!groupedCaptures.has(node)) {
+            groupedCaptures.set(node, { call: node });
+          } else {
+            const group = groupedCaptures.get(node)!;
+            group.call = node;
+          }
+        } else if (name === 'callee') {
+          const callNode = node.parent;
+          if (!callNode) continue;
+
+          if (!groupedCaptures.has(callNode)) {
+            groupedCaptures.set(callNode, { callee: node.text });
+          } else {
+            const group = groupedCaptures.get(callNode)!;
+            group.callee = node.text;
+          }
+        }
+      }
+
+      // Find the enclosing function or method for each call
+      for (const [callNode, data] of groupedCaptures.entries()) {
+        if (!data.callee || !data.call) continue;
+
+        // Find the enclosing function or method
+        let currentNode: SyntaxNode | null = callNode;
+        let sourceName: string | null = null;
+
+        while (currentNode && !sourceName) {
+          if (
+            [
+              'function_declaration',
+              'method_definition',
+              'method_declaration',
+              'class_method',
+            ].includes(currentNode.type)
+          ) {
+            const nameNode = currentNode.childForFieldName('name');
+            if (nameNode) {
+              sourceName = nameNode.text;
+              break;
+            }
+          } else if (currentNode.type === 'variable_declarator') {
+            const nameNode = currentNode.childForFieldName('name');
+            if (nameNode) {
+              sourceName = nameNode.text;
+              break;
+            }
+          }
+          currentNode = currentNode.parent;
+        }
+
+        if (!sourceName) {
+          sourceName = 'anonymous';
+        }
+
+        functionCalls.push({
+          source: sourceName,
+          target: data.callee,
+          location: {
+            filePath,
+            startLine: callNode.startPosition.row + 1,
+            endLine: callNode.endPosition.row + 1,
+          },
+        });
+      }
+    } catch (error) {
+      const errorMsg = error instanceof Error ? error.message : String(error);
+      logger.error('Failed to extract function calls', { language, filePath, error: errorMsg });
+    }
+
+    return functionCalls;
+  }
+
+  /**
+   * Find all imports in the AST
+   */
+  function findAllImports(
+    rootNode: SyntaxNode,
+    filePath: string,
+    language: string
+  ): Omit<CodeRelationship, 'type'>[] {
+    const imports: Omit<CodeRelationship, 'type'>[] = [];
+    const importQueries: Record<string, string | null> = {
+      javascript: `
+        (import_statement
+          source: (string) @source) @import
+      `,
+      typescript: `
+        (import_statement
+          source: (string) @source) @import
+      `,
+      tsx: `
+        (import_statement
+          source: (string) @source) @import
+      `,
+      java: `
+        (import_declaration
+          name: (_) @source) @import
+      `,
+      json: null, // JSON doesn't have imports
+    };
+
+    const mappedLang = mapLanguageId(language);
+    const queryString = importQueries[mappedLang];
+    if (!queryString) return imports;
+
+    try {
+      const langModule = LANGUAGE_MODULES[mappedLang];
+      if (!langModule) return imports;
+
+      const query = getOrCreateQuery(langModule, queryString);
+      const captures = query.captures(rootNode);
+
+      const groupedCaptures = new Map<SyntaxNode, { source?: string; importNode?: SyntaxNode }>();
+
+      for (const { node, name } of captures) {
+        if (name === 'import') {
+          if (!groupedCaptures.has(node)) {
+            groupedCaptures.set(node, { importNode: node });
+          } else {
+            const group = groupedCaptures.get(node)!;
+            group.importNode = node;
+          }
+        } else if (name === 'source') {
+          const importNode = node.parent;
+          if (!importNode) continue;
+
+          let sourceText = node.text;
+          // Remove quotes from string literals
+          if (sourceText.startsWith('"') || sourceText.startsWith("'")) {
+            sourceText = sourceText.substring(1, sourceText.length - 1);
+          }
+
+          if (!groupedCaptures.has(importNode)) {
+            groupedCaptures.set(importNode, { source: sourceText });
+          } else {
+            const group = groupedCaptures.get(importNode)!;
+            group.source = sourceText;
+          }
+        }
+      }
+
+      for (const [importNode, data] of groupedCaptures.entries()) {
+        if (!data.source || !data.importNode) continue;
+
+        imports.push({
+          source: path.basename(filePath, path.extname(filePath)),
+          target: data.source,
+          location: {
+            filePath,
+            startLine: importNode.startPosition.row + 1,
+            endLine: importNode.endPosition.row + 1,
+          },
+        });
+      }
+    } catch (error) {
+      const errorMsg = error instanceof Error ? error.message : String(error);
+      logger.error('Failed to extract imports', { language, filePath, error: errorMsg });
+    }
+
+    return imports;
+  }
+
+  /**
+   * Find class inheritance relationships in the AST
+   */
+  function findClassInheritance(
+    rootNode: SyntaxNode,
+    filePath: string,
+    language: string
+  ): Omit<CodeRelationship, 'type'>[] {
+    const inheritanceRelationships: Omit<CodeRelationship, 'type'>[] = [];
+    const inheritanceQueries: Record<string, string | null> = {
+      // Using simplified queries to avoid field-related errors
+      javascript: `
+        (class_declaration) @class
+      `,
+      typescript: `
+        (class_declaration) @class
+      `,
+      tsx: `
+        (class_declaration) @class
+      `,
+      java: `
+        (class_declaration
+          name: (identifier) @child
+          (superclass
+            (type_identifier) @parent)) @class
+      `,
+      json: null, // JSON doesn't have class inheritance
+    };
+
+    const mappedLang = mapLanguageId(language);
+    const queryString = inheritanceQueries[mappedLang];
+    if (!queryString) return inheritanceRelationships;
+
+    try {
+      const langModule = LANGUAGE_MODULES[mappedLang];
+      if (!langModule) return inheritanceRelationships;
+
+      const query = getOrCreateQuery(langModule, queryString);
+      const captures = query.captures(rootNode);
+
+      // Simplify the capturing logic
+      for (const { node, name } of captures) {
+        if (name === 'class') {
+          // Get the class node
+          const classNode = node;
+
+          // Look for child nodes
+          let childName = null;
+          let parentName = null;
+
+          // First identify the class name
+          for (let i = 0; i < classNode.namedChildCount; i++) {
+            const child = classNode.namedChild(i);
+            if (!child) continue;
+
+            if (child.type === 'identifier') {
+              childName = child.text;
+              break;
+            }
+          }
+
+          // Then look for extends_clause if there is one
+          for (let i = 0; i < classNode.namedChildCount; i++) {
+            const child = classNode.namedChild(i);
+            if (!child) continue;
+
+            if (child.type === 'extends_clause') {
+              // The parent class should be the first child of the extends_clause
+              const firstChild = child.namedChild(0);
+              if (firstChild) {
+                parentName = firstChild.text;
+                break;
+              }
+            }
+          }
+
+          if (childName && parentName) {
+            inheritanceRelationships.push({
+              source: childName,
+              target: parentName,
+              location: {
+                filePath,
+                startLine: classNode.startPosition.row + 1,
+                endLine: classNode.endPosition.row + 1,
+              },
+            });
+          }
+        }
+      }
+    } catch (error) {
+      const errorMsg = error instanceof Error ? error.message : String(error);
+      logger.error('Failed to extract class inheritance', { language, filePath, error: errorMsg });
+    }
+
+    return inheritanceRelationships;
+  }
+
+  /**
+   * Extract code relationships from the AST
+   */
+  function extractCodeRelationships(
+    tree: Tree,
+    code: string,
+    filePath: string,
+    language: string
+  ): CodeRelationship[] {
+    const relationships: CodeRelationship[] = [];
+    const rootNode: SyntaxNode = tree.rootNode;
+
+    // Extract function calls
+    const functionCalls = findAllFunctionCalls(rootNode, code, filePath, language);
+
+    // Extract imports/exports
+    const imports = findAllImports(rootNode, filePath, language);
+
+    // Extract class inheritance
+    const inheritance = findClassInheritance(rootNode, filePath, language);
+
+    // Combine all relationships
+    relationships.push(
+      ...functionCalls.map((call) => ({
+        type: 'function_call' as RelationshipType,
+        ...call,
+      })),
+      ...imports.map((imp) => ({
+        type: 'import' as RelationshipType,
+        ...imp,
+      })),
+      ...inheritance.map((inh) => ({
+        type: 'inheritance' as RelationshipType,
+        ...inh,
+      }))
+    );
+
+    return relationships;
+  }
+
   return {
     parseCodeToChunks,
     updateTree,
+    extractCodeRelationships,
+    findAllFunctionCalls,
+    findAllImports,
+    findClassInheritance,
   };
 }

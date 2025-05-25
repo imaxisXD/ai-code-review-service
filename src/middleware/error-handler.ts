@@ -1,6 +1,6 @@
 import { MiddlewareHandler } from 'hono';
 import { createMiddleware } from 'hono/factory';
-import { logger } from '../utils/logger';
+import { logger } from '../utils/logger.js';
 
 export interface ErrorWithStatus extends Error {
   status?: number;
