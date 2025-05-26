@@ -4,7 +4,7 @@ import { createGitService } from './git-service.js';
 import { api } from '../convex/api.js';
 import { logger } from '../utils/logger.js';
 import { PullRequestReviewJob, ReviewComment, PullRequestReviewResult } from '../types.js';
-import { SimpleGit } from 'simple-git';
+// SimpleGit import removed - now using GitHub API instead of git operations
 import { createAppAuth } from '@octokit/auth-app';
 import { Octokit } from '@octokit/rest';
 import { anthropic } from '@ai-sdk/anthropic';
@@ -170,101 +170,6 @@ export function createPullRequestReviewService(deps: {
   // Job deduplication cache to prevent processing the same job multiple times
   const processedJobs = new Map<string, { timestamp: number; result: any }>();
   const JOB_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
-
-  /**
-   * Parse diff to extract changed line ranges and create line mapping
-   */
-  function parseDiffForLineRanges(diff: string): {
-    changedLines: Set<number>;
-    addedLines: Set<number>;
-    deletedLines: Set<number>;
-    lineMapping: Map<number, { type: 'added' | 'deleted' | 'context'; originalLine?: number }>;
-  } {
-    const changedLines = new Set<number>();
-    const addedLines = new Set<number>();
-    const deletedLines = new Set<number>();
-    const lineMapping = new Map<
-      number,
-      { type: 'added' | 'deleted' | 'context'; originalLine?: number }
-    >();
-
-    const lines = diff.split('\n');
-    let currentNewLine = 0;
-    let currentOldLine = 0;
-
-    for (const line of lines) {
-      // Parse hunk headers like @@ -1,4 +1,6 @@
-      const hunkMatch = line.match(/^@@\s+-(\d+)(?:,(\d+))?\s+\+(\d+)(?:,(\d+))?\s+@@/);
-      if (hunkMatch) {
-        currentOldLine = parseInt(hunkMatch[1]);
-        currentNewLine = parseInt(hunkMatch[3]);
-        continue;
-      }
-
-      // Skip diff headers
-      if (
-        line.startsWith('diff --git') ||
-        line.startsWith('index ') ||
-        line.startsWith('---') ||
-        line.startsWith('+++')
-      ) {
-        continue;
-      }
-
-      // Process diff content lines
-      if (line.startsWith('+')) {
-        // Added line
-        addedLines.add(currentNewLine);
-        changedLines.add(currentNewLine);
-        lineMapping.set(currentNewLine, { type: 'added' });
-        currentNewLine++;
-      } else if (line.startsWith('-')) {
-        // Deleted line (doesn't increment new line counter)
-        deletedLines.add(currentOldLine);
-        lineMapping.set(currentOldLine, { type: 'deleted' });
-        currentOldLine++;
-      } else if (line.startsWith(' ') || line === '') {
-        // Context line (unchanged)
-        lineMapping.set(currentNewLine, { type: 'context', originalLine: currentOldLine });
-        currentNewLine++;
-        currentOldLine++;
-      }
-    }
-
-    return { changedLines, addedLines, deletedLines, lineMapping };
-  }
-
-  /**
-   * Create enhanced file content with line number annotations
-   */
-  function createAnnotatedFileContent(
-    content: string,
-    changedLines: Set<number>,
-    addedLines: Set<number>,
-    commentLines: Set<number>
-  ): string {
-    const lines = content.split('\n');
-    const annotatedLines: string[] = [];
-
-    for (let i = 0; i < lines.length; i++) {
-      const lineNumber = i + 1;
-      const line = lines[i];
-
-      let annotation = '';
-      if (addedLines.has(lineNumber)) {
-        annotation = ' // [ADDED LINE]';
-      } else if (changedLines.has(lineNumber)) {
-        annotation = ' // [MODIFIED LINE]';
-      } else if (commentLines.has(lineNumber)) {
-        annotation = ' // [COMMENT LINE - FILTERED]';
-      }
-
-      annotatedLines.push(`${lineNumber.toString().padStart(4, ' ')}: ${line}${annotation}`);
-    }
-
-    return annotatedLines.join('\n');
-  }
-
   /**
    * Improved comment removal that tracks which lines were comments
    */
@@ -387,6 +292,7 @@ export function createPullRequestReviewService(deps: {
 
   /**
    * Validate and correct line numbers based on actual file content and changes
+   * Ensures that line numbers correspond to lines that are part of the diff
    */
   function validateAndCorrectLineNumbers(
     issues: Array<{
@@ -400,7 +306,8 @@ export function createPullRequestReviewService(deps: {
     fileContent: string,
     changedLines: Set<number>,
     addedLines: Set<number>,
-    commentLines: Set<number>
+    commentLines: Set<number>,
+    validDiffLines: Set<number>
   ): Array<{
     line: number;
     severity: 'critical' | 'warning' | 'info';
@@ -410,8 +317,16 @@ export function createPullRequestReviewService(deps: {
     explanation: string;
   }> {
     const totalLines = fileContent.split('\n').length;
+    const validatedIssues: Array<{
+      line: number;
+      severity: 'critical' | 'warning' | 'info';
+      category: 'security' | 'bug' | 'performance' | 'maintainability';
+      message: string;
+      suggestion: string;
+      explanation: string;
+    }> = [];
 
-    return issues.map((issue) => {
+    for (const issue of issues) {
       let correctedLine = issue.line;
 
       // Ensure line number is within file bounds
@@ -421,18 +336,72 @@ export function createPullRequestReviewService(deps: {
         correctedLine = totalLines;
       }
 
-      // If the line is a comment line, try to find the nearest non-comment changed line
-      if (commentLines.has(correctedLine)) {
-        // Look for the nearest changed line (prefer added lines)
-        let nearestChangedLine = correctedLine;
+      // CRITICAL: Ensure the line is part of the diff (GitHub requirement)
+      if (!validDiffLines.has(correctedLine)) {
+        // Try to find the nearest valid diff line
+        let nearestValidLine = correctedLine;
         let minDistance = Infinity;
 
-        for (const changedLine of changedLines) {
-          if (!commentLines.has(changedLine)) {
-            const distance = Math.abs(changedLine - correctedLine);
+        // First, prefer changed lines (added or modified)
+        for (const validLine of validDiffLines) {
+          if (changedLines.has(validLine)) {
+            const distance = Math.abs(validLine - correctedLine);
             if (distance < minDistance) {
               minDistance = distance;
-              nearestChangedLine = changedLine;
+              nearestValidLine = validLine;
+            }
+          }
+        }
+
+        // If no changed lines found within reasonable distance, try any valid diff line
+        if (minDistance > config.lineNumberValidation.maxCorrectionDistance) {
+          minDistance = Infinity;
+          for (const validLine of validDiffLines) {
+            const distance = Math.abs(validLine - correctedLine);
+            if (distance < minDistance) {
+              minDistance = distance;
+              nearestValidLine = validLine;
+            }
+          }
+        }
+
+        // If we found a valid line within reasonable distance, use it
+        if (
+          minDistance <= config.lineNumberValidation.maxCorrectionDistance &&
+          nearestValidLine !== correctedLine
+        ) {
+          logger.info('Corrected line number to valid diff line', {
+            originalLine: correctedLine,
+            correctedLine: nearestValidLine,
+            distance: minDistance,
+            reason: 'Original line not part of diff',
+          });
+          correctedLine = nearestValidLine;
+        } else {
+          // Cannot find a valid line within reasonable distance, skip this comment
+          logger.warn('Skipping comment - no valid diff line found', {
+            originalLine: correctedLine,
+            maxDistance: config.lineNumberValidation.maxCorrectionDistance,
+            nearestDistance: minDistance,
+            validDiffLinesCount: validDiffLines.size,
+            message: issue.message.substring(0, 100),
+          });
+          continue; // Skip this issue
+        }
+      }
+
+      // If the line is a comment line, try to find the nearest non-comment valid line
+      if (commentLines.has(correctedLine)) {
+        // Look for the nearest valid diff line that's not a comment
+        let nearestValidLine = correctedLine;
+        let minDistance = Infinity;
+
+        for (const validLine of validDiffLines) {
+          if (!commentLines.has(validLine)) {
+            const distance = Math.abs(validLine - correctedLine);
+            if (distance < minDistance) {
+              minDistance = distance;
+              nearestValidLine = validLine;
             }
           }
         }
@@ -440,32 +409,35 @@ export function createPullRequestReviewService(deps: {
         // If we found a better line within reasonable distance, use it
         if (
           minDistance <= config.lineNumberValidation.maxCorrectionDistance &&
-          nearestChangedLine !== correctedLine
+          nearestValidLine !== correctedLine
         ) {
           logger.info('Corrected line number from comment line', {
             originalLine: correctedLine,
-            correctedLine: nearestChangedLine,
+            correctedLine: nearestValidLine,
             reason: 'Original line was a comment',
           });
-          correctedLine = nearestChangedLine;
+          correctedLine = nearestValidLine;
         }
       }
 
-      // Prefer lines that were actually changed (if enabled)
+      // Prefer lines that were actually changed (if enabled and line is still valid)
       if (
         config.lineNumberValidation.preferChangedLines &&
         !changedLines.has(correctedLine) &&
-        changedLines.size > 0
+        changedLines.size > 0 &&
+        validDiffLines.has(correctedLine) // Ensure we don't break the diff requirement
       ) {
-        // Find the nearest changed line
+        // Find the nearest changed line that's also a valid diff line
         let nearestChangedLine = correctedLine;
         let minDistance = Infinity;
 
         for (const changedLine of changedLines) {
-          const distance = Math.abs(changedLine - correctedLine);
-          if (distance < minDistance) {
-            minDistance = distance;
-            nearestChangedLine = changedLine;
+          if (validDiffLines.has(changedLine)) {
+            const distance = Math.abs(changedLine - correctedLine);
+            if (distance < minDistance) {
+              minDistance = distance;
+              nearestChangedLine = changedLine;
+            }
           }
         }
 
@@ -480,11 +452,32 @@ export function createPullRequestReviewService(deps: {
         }
       }
 
-      return {
-        ...issue,
-        line: correctedLine,
-      };
-    });
+      // Final validation: ensure the corrected line is still valid
+      if (validDiffLines.has(correctedLine)) {
+        validatedIssues.push({
+          ...issue,
+          line: correctedLine,
+        });
+      } else {
+        logger.warn('Final validation failed - skipping comment', {
+          originalLine: issue.line,
+          correctedLine,
+          message: issue.message.substring(0, 100),
+        });
+      }
+    }
+
+    const skippedCount = issues.length - validatedIssues.length;
+    if (skippedCount > 0) {
+      logger.info('Line number validation summary', {
+        originalIssues: issues.length,
+        validatedIssues: validatedIssues.length,
+        skippedIssues: skippedCount,
+        validDiffLinesCount: validDiffLines.size,
+      });
+    }
+
+    return validatedIssues;
   }
 
   /**
@@ -743,13 +736,18 @@ export function createPullRequestReviewService(deps: {
       });
 
       // Step 4: Extract changed files and their content
-      const changedFiles = await extractChangedFiles(
-        repoGit,
-        cloneDir,
-        diffSummary.files,
-        baseSha,
-        commitSha,
-        gitService
+      const changedFiles = await extractChangedFilesFromGitHub(
+        new Octokit({
+          authStrategy: createAppAuth,
+          auth: {
+            appId: process.env.GITHUB_APP_ID,
+            privateKey: process.env.GITHUB_PRIVATE_KEY,
+            installationId,
+          },
+        }),
+        owner,
+        repo,
+        prNumber
       );
 
       if (changedFiles.length === 0) {
@@ -772,7 +770,10 @@ export function createPullRequestReviewService(deps: {
           hasChanges: f.diffAnalysis?.changedLines?.size || 0,
         })),
       });
-      const reviewComments = await generateCodeReview(changedFiles, repository);
+      const { comments: reviewComments, fileValidDiffLines } = await generateCodeReview(
+        changedFiles,
+        repository
+      );
 
       logger.info('Code review generation completed', {
         totalComments: reviewComments.length,
@@ -792,7 +793,8 @@ export function createPullRequestReviewService(deps: {
         repo,
         prNumber,
         reviewComments,
-        commitSha
+        commitSha,
+        fileValidDiffLines
       );
 
       logger.info('PR review completed', {
@@ -841,131 +843,269 @@ export function createPullRequestReviewService(deps: {
   }
 
   /**
-   * Extract changed files and their content from the PR
+   * Extract changed files using GitHub API instead of git operations
    */
-  async function extractChangedFiles(
-    repoGit: SimpleGit,
-    cloneDir: string,
-    files: any[],
-    baseSha: string,
-    commitSha: string,
-    gitService: ReturnType<typeof createGitService>
+  async function extractChangedFilesFromGitHub(
+    octokit: Octokit,
+    owner: string,
+    repo: string,
+    prNumber: number
   ) {
-    const changedFiles = [];
+    try {
+      logger.info('Fetching PR files from GitHub API', { owner, repo, prNumber });
 
-    for (const file of files) {
-      const filePath = typeof file.file === 'string' ? file.file : file.file?.name;
-      if (!filePath || file.binary) continue;
+      // Get all files changed in the PR with their diffs
+      const { data: files } = await octokit.rest.pulls.listFiles({
+        owner,
+        repo,
+        pull_number: prNumber,
+      });
 
-      try {
-        // Get the current file content first
-        const fs = await import('fs/promises');
-        const fullPath = `${cloneDir}/${filePath}`;
+      logger.info('Retrieved PR files from GitHub', {
+        filesCount: files.length,
+        fileDetails: files.map((f) => ({
+          filename: f.filename,
+          status: f.status,
+          additions: f.additions,
+          deletions: f.deletions,
+          changes: f.changes,
+          hasPatch: !!f.patch,
+        })),
+      });
 
-        let content = '';
-        try {
-          content = await fs.readFile(fullPath, 'utf8');
-        } catch {
-          logger.debug('Could not read file, might be deleted', { filePath });
+      const changedFiles = [];
+
+      for (const file of files) {
+        // Skip binary files or files without patches
+        if (!file.patch || file.status === ('removed' as any)) {
+          logger.debug('Skipping file without patch or removed file', {
+            filename: file.filename,
+            status: file.status,
+            hasPatch: !!file.patch,
+          });
           continue;
         }
 
-        // Skip binary files or files that are too large
-        if (content.includes('\0')) {
-          logger.debug('Skipping binary file', { filePath });
-          continue;
-        }
-
-        // Remove comments from code content to avoid reviewing them
-        const language = getLanguageFromPath(filePath);
-        const { filteredContent, commentLines } = removeCommentsFromCodeWithTracking(
-          content,
-          language
-        );
-
-        // Try to get the file diff (suppress verbose output)
-        let diff = '';
         try {
-          diff = await gitService.getFileDiff(repoGit, baseSha, commitSha, filePath);
-
-          // If getFileDiff returned empty string due to error handling, treat as no diff
-          if (!diff || diff.trim() === '') {
-            logger.debug('Git service returned empty diff, likely due to error handling', {
-              filePath,
+          // Get file content from GitHub API
+          let content = '';
+          try {
+            const { data: fileData } = await octokit.rest.repos.getContent({
+              owner,
+              repo,
+              path: file.filename,
+              ref: 'HEAD', // Get the latest version
             });
-            diff = ''; // Ensure it's empty for synthetic diff creation
+
+            if ('content' in fileData && fileData.content) {
+              content = Buffer.from(fileData.content, 'base64').toString('utf8');
+            }
+          } catch (error) {
+            logger.warn('Could not fetch file content from GitHub API', {
+              filename: file.filename,
+              error: error instanceof Error ? error.message : String(error),
+            });
+            continue;
           }
+
+          // Skip binary files
+          if (content.includes('\0')) {
+            logger.debug('Skipping binary file', { filename: file.filename });
+            continue;
+          }
+
+          const language = getLanguageFromPath(file.filename);
+          const { filteredContent, commentLines } = removeCommentsFromCodeWithTracking(
+            content,
+            language
+          );
+
+          // Parse the GitHub patch to extract diff positions and line mappings
+          const diffAnalysis = parseGitHubPatch(file.patch, file.status);
+
+          // Validate that we have valid positions for comments
+          if (diffAnalysis.validDiffPositions.size === 0) {
+            logger.warn('No valid diff positions found for file, skipping', {
+              filename: file.filename,
+              status: file.status,
+              patchLength: file.patch.length,
+            });
+            continue;
+          }
+
+          // Create annotated content for better AI understanding
+          const annotatedContent = createAnnotatedFileContentWithPositions(
+            filteredContent,
+            diffAnalysis.changedLines,
+            diffAnalysis.addedLines,
+            commentLines,
+            diffAnalysis.lineToPositionMap
+          );
+
+          changedFiles.push({
+            path: file.filename,
+            content: filteredContent,
+            originalContent: content,
+            annotatedContent,
+            patch: file.patch, // GitHub patch format
+            language,
+            diffAnalysis,
+            commentLines,
+            isNewFile: file.status === 'added',
+            isDeletedFile: file.status === 'removed',
+            githubFile: file, // Store the original GitHub file object
+          });
+
+          logger.info('Processed file from GitHub API', {
+            filename: file.filename,
+            status: file.status,
+            validPositions: diffAnalysis.validDiffPositions.size,
+            changedLines: diffAnalysis.changedLines.size,
+          });
         } catch (error) {
-          logger.debug('Could not get diff for file, will review entire file content', {
-            filePath,
+          logger.warn('Failed to process file from GitHub API', {
+            filename: file.filename,
             error: error instanceof Error ? error.message : String(error),
           });
-          diff = ''; // Reset to empty for synthetic diff creation
         }
+      }
 
-        // Parse diff to get changed line information
-        let diffAnalysis = {
-          changedLines: new Set<number>(),
-          addedLines: new Set<number>(),
-          deletedLines: new Set<number>(),
-          lineMapping: new Map(),
-        };
+      return changedFiles;
+    } catch (error) {
+      logger.error('Failed to fetch PR files from GitHub API', {
+        owner,
+        repo,
+        prNumber,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      throw error;
+    }
+  }
 
-        // If we couldn't get a diff, create a synthetic diff indicating the entire file
-        if (!diff || diff.trim() === '') {
-          logger.info('Creating synthetic diff for file review', {
-            filePath,
-            reason: 'No git diff available - will review entire file content',
-          });
+  /**
+   * Parse GitHub patch format to extract diff positions and line mappings
+   */
+  function parseGitHubPatch(
+    patch: string,
+    fileStatus: string
+  ): {
+    changedLines: Set<number>;
+    addedLines: Set<number>;
+    deletedLines: Set<number>;
+    validDiffPositions: Set<number>; // GitHub diff positions (not line numbers)
+    lineToPositionMap: Map<number, number>; // Maps line numbers to diff positions
+    positionToLineMap: Map<number, number>; // Maps diff positions to line numbers
+  } {
+    const changedLines = new Set<number>();
+    const addedLines = new Set<number>();
+    const deletedLines = new Set<number>();
+    const validDiffPositions = new Set<number>();
+    const lineToPositionMap = new Map<number, number>();
+    const positionToLineMap = new Map<number, number>();
 
-          const lines = content.split('\n');
-          const lineCount = lines.length;
+    const lines = patch.split('\n');
+    let currentNewLine = 0;
+    let currentOldLine = 0;
+    let diffPosition = 0; // GitHub diff position counter
 
-          // Create a synthetic diff that shows the entire file as new/modified content
-          diff = `diff --git a/${filePath} b/${filePath}
-index 0000000..0000000 100644
---- a/${filePath}
-+++ b/${filePath}
-@@ -0,0 +1,${lineCount} @@
-${lines.map((line) => `+${line}`).join('\n')}`;
+    for (const line of lines) {
+      // Parse hunk headers like @@ -1,4 +1,6 @@
+      const hunkMatch = line.match(/^@@\s+-(\d+)(?:,(\d+))?\s+\+(\d+)(?:,(\d+))?\s+@@/);
+      if (hunkMatch) {
+        currentOldLine = parseInt(hunkMatch[1]);
+        currentNewLine = parseInt(hunkMatch[3]);
+        diffPosition++; // Hunk headers count as positions
+        continue;
+      }
 
-          // For synthetic diffs, mark all lines as added
-          for (let i = 1; i <= lineCount; i++) {
-            diffAnalysis.changedLines.add(i);
-            diffAnalysis.addedLines.add(i);
-          }
-        } else {
-          // Parse the actual diff to get line information
-          diffAnalysis = parseDiffForLineRanges(diff);
-        }
+      // Skip patch headers
+      if (
+        line.startsWith('diff --git') ||
+        line.startsWith('index ') ||
+        line.startsWith('---') ||
+        line.startsWith('+++') ||
+        line.startsWith('new file mode') ||
+        line.startsWith('deleted file mode')
+      ) {
+        continue;
+      }
 
-        // Create annotated content for better AI understanding
-        const annotatedContent = createAnnotatedFileContent(
-          filteredContent,
-          diffAnalysis.changedLines,
-          diffAnalysis.addedLines,
-          commentLines
-        );
-
-        changedFiles.push({
-          path: filePath,
-          content: filteredContent,
-          originalContent: content,
-          annotatedContent,
-          diff,
-          language,
-          diffAnalysis,
-          commentLines,
-        });
-      } catch (error) {
-        logger.warn('Failed to process file', {
-          filePath,
-          error: error instanceof Error ? error.message : String(error),
-        });
+      // Process diff content lines
+      if (line.startsWith('+')) {
+        // Added line
+        diffPosition++;
+        addedLines.add(currentNewLine);
+        changedLines.add(currentNewLine);
+        validDiffPositions.add(diffPosition);
+        lineToPositionMap.set(currentNewLine, diffPosition);
+        positionToLineMap.set(diffPosition, currentNewLine);
+        currentNewLine++;
+      } else if (line.startsWith('-')) {
+        // Deleted line (cannot be commented on in GitHub)
+        diffPosition++;
+        deletedLines.add(currentOldLine);
+        currentOldLine++;
+        // Note: We don't add deleted lines to validDiffPositions since they can't be commented on
+      } else if (line.startsWith(' ')) {
+        // Context line (unchanged) - these can be commented on
+        diffPosition++;
+        validDiffPositions.add(diffPosition);
+        lineToPositionMap.set(currentNewLine, diffPosition);
+        positionToLineMap.set(diffPosition, currentNewLine);
+        currentNewLine++;
+        currentOldLine++;
       }
     }
 
-    return changedFiles;
+    // For new files, all lines are considered added
+    if (fileStatus === 'added') {
+      // GitHub treats new files specially - all lines are valid for comments
+      // but we need to ensure we have the correct position mapping
+    }
+
+    return {
+      changedLines,
+      addedLines,
+      deletedLines,
+      validDiffPositions,
+      lineToPositionMap,
+      positionToLineMap,
+    };
+  }
+
+  /**
+   * Create enhanced file content with line number annotations and position mapping
+   */
+  function createAnnotatedFileContentWithPositions(
+    content: string,
+    changedLines: Set<number>,
+    addedLines: Set<number>,
+    commentLines: Set<number>,
+    lineToPositionMap: Map<number, number>
+  ): string {
+    const lines = content.split('\n');
+    const annotatedLines: string[] = [];
+
+    for (let i = 0; i < lines.length; i++) {
+      const lineNumber = i + 1;
+      const line = lines[i];
+      const diffPosition = lineToPositionMap.get(lineNumber);
+
+      let annotation = '';
+      if (addedLines.has(lineNumber)) {
+        annotation = ` // [ADDED LINE - Position: ${diffPosition || 'N/A'}]`;
+      } else if (changedLines.has(lineNumber)) {
+        annotation = ` // [MODIFIED LINE - Position: ${diffPosition || 'N/A'}]`;
+      } else if (commentLines.has(lineNumber)) {
+        annotation = ' // [COMMENT LINE - FILTERED]';
+      } else if (diffPosition) {
+        annotation = ` // [CONTEXT LINE - Position: ${diffPosition}]`;
+      }
+
+      annotatedLines.push(`${lineNumber.toString().padStart(4, ' ')}: ${line}${annotation}`);
+    }
+
+    return annotatedLines.join('\n');
   }
 
   /**
@@ -974,8 +1114,9 @@ ${lines.map((line) => `+${line}`).join('\n')}`;
   async function generateCodeReview(
     changedFiles: any[],
     repository: any
-  ): Promise<ReviewComment[]> {
+  ): Promise<{ comments: ReviewComment[]; fileValidDiffLines: Map<string, Set<number>> }> {
     const reviewComments: ReviewComment[] = [];
+    const fileValidDiffLines = new Map<string, Set<number>>();
 
     // Filter files based on skip patterns and limits
     const filteredFiles = changedFiles
@@ -991,7 +1132,13 @@ ${lines.map((line) => `+${line}`).join('\n')}`;
 
     for (const file of filteredFiles) {
       try {
-        logger.info('Analyzing file for review', { path: file.path });
+        logger.info('Analyzing file for review', {
+          path: file.path,
+          validDiffLines: file.diffAnalysis.validDiffLines.size,
+        });
+
+        // Store valid diff lines for this file
+        fileValidDiffLines.set(file.path, file.diffAnalysis.validDiffLines);
 
         // Get context for this file using existing embeddings
         const similarCode = await getSimilarCodeContext(file, repository._id);
@@ -1000,7 +1147,11 @@ ${lines.map((line) => `+${line}`).join('\n')}`;
         const analysis = await analyzeCodeWithLLM(file, similarCode);
 
         // Convert LLM analysis into review comments
-        const fileComments = convertAnalysisToComments(analysis.issues || [], file.path);
+        const fileComments = convertAnalysisToComments(
+          analysis.issues || [],
+          file.path,
+          file.diffAnalysis.lineToPositionMap
+        );
 
         // Limit comments per file to avoid overwhelming developers
         const limitedComments = fileComments.slice(0, config.maxCommentsPerFile);
@@ -1022,7 +1173,7 @@ ${lines.map((line) => `+${line}`).join('\n')}`;
       }
     }
 
-    return reviewComments;
+    return { comments: reviewComments, fileValidDiffLines };
   }
 
   /**
@@ -1369,7 +1520,8 @@ If no actionable issues are found, return an empty issues array and explain this
               file.content,
               file.diffAnalysis.changedLines,
               file.diffAnalysis.addedLines,
-              file.commentLines
+              file.commentLines,
+              file.diffAnalysis.validDiffLines
             )
           : result.object.issues;
 
@@ -1442,9 +1594,13 @@ If no actionable issues are found, return an empty issues array and explain this
   }
 
   /**
-   * Convert LLM analysis into review comments
+   * Convert LLM analysis into review comments with GitHub diff positions
    */
-  function convertAnalysisToComments(analysis: any[], filePath: string): ReviewComment[] {
+  function convertAnalysisToComments(
+    analysis: any[],
+    filePath: string,
+    lineToPositionMap: Map<number, number>
+  ): ReviewComment[] {
     if (!Array.isArray(analysis)) {
       return [];
     }
@@ -1481,9 +1637,21 @@ If no actionable issues are found, return an empty issues array and explain this
         // Add AI signature
         body += '\n\n---\n*🤖 Generated by Migaki AI*';
 
+        // Get the GitHub diff position for this line
+        const diffPosition = lineToPositionMap.get(item.line || 1);
+
+        if (!diffPosition) {
+          logger.warn('No diff position found for line, comment may be skipped', {
+            filePath,
+            line: item.line,
+            availablePositions: Array.from(lineToPositionMap.keys()).slice(0, 5),
+          });
+        }
+
         return {
           path: filePath,
           line: item.line || 1,
+          position: diffPosition, // GitHub diff position
           body,
           severity: (['info', 'warning', 'critical'].includes(item.severity)
             ? item.severity === 'critical'
@@ -1493,7 +1661,56 @@ If no actionable issues are found, return an empty issues array and explain this
           category: item.category || 'general',
           suggestion: item.suggestion,
         };
-      });
+      })
+      .filter((comment) => comment.position !== undefined); // Only include comments with valid positions
+  }
+
+  /**
+   * Validate that all comments have valid line numbers for GitHub PR review
+   */
+  function validateCommentsForGitHub(
+    comments: ReviewComment[],
+    fileValidDiffLines?: Map<string, Set<number>>
+  ): {
+    validComments: ReviewComment[];
+    invalidComments: Array<{ comment: ReviewComment; reason: string }>;
+  } {
+    const validComments: ReviewComment[] = [];
+    const invalidComments: Array<{ comment: ReviewComment; reason: string }> = [];
+
+    for (const comment of comments) {
+      // Basic validation
+      if (!comment.path || typeof comment.path !== 'string') {
+        invalidComments.push({ comment, reason: 'Missing or invalid path' });
+        continue;
+      }
+
+      if (!comment.line || typeof comment.line !== 'number' || comment.line < 1) {
+        invalidComments.push({ comment, reason: 'Missing or invalid line number' });
+        continue;
+      }
+
+      if (!comment.body || typeof comment.body !== 'string' || comment.body.trim() === '') {
+        invalidComments.push({ comment, reason: 'Missing or empty body' });
+        continue;
+      }
+
+      // Validate against diff lines if available
+      if (fileValidDiffLines) {
+        const validLines = fileValidDiffLines.get(comment.path);
+        if (validLines && !validLines.has(comment.line)) {
+          invalidComments.push({
+            comment,
+            reason: `Line ${comment.line} is not part of the diff for file ${comment.path}`,
+          });
+          continue;
+        }
+      }
+
+      validComments.push(comment);
+    }
+
+    return { validComments, invalidComments };
   }
 
   /**
@@ -1506,7 +1723,8 @@ If no actionable issues are found, return an empty issues array and explain this
     repo: string,
     prNumber: number,
     comments: ReviewComment[],
-    commitSha: string
+    commitSha: string,
+    fileValidDiffLines?: Map<string, Set<number>>
   ) {
     const appId = process.env.GITHUB_APP_ID;
     const privateKey = process.env.GITHUB_PRIVATE_KEY;
@@ -1545,11 +1763,37 @@ If no actionable issues are found, return an empty issues array and explain this
         return [];
       }
 
+      // Validate comments before posting
+      const { validComments, invalidComments } = validateCommentsForGitHub(
+        filteredComments,
+        fileValidDiffLines
+      );
+
+      if (invalidComments.length > 0) {
+        logger.warn('Found invalid comments that will be skipped', {
+          invalidCount: invalidComments.length,
+          totalCount: filteredComments.length,
+          invalidComments: invalidComments.map((ic) => ({
+            path: ic.comment.path,
+            line: ic.comment.line,
+            reason: ic.reason,
+          })),
+        });
+      }
+
+      if (validComments.length === 0) {
+        logger.warn('No valid comments to post after validation');
+        return [];
+      }
+
+      // Use the validated comments
+      filteredComments = validComments;
+
       // Use GitHub's Pull Request Review API for batch posting
       // This is much more efficient and avoids rate limits
       const reviewComments = filteredComments.map((comment) => ({
         path: comment.path,
-        line: comment.line,
+        position: comment.position, // Use diff position instead of line number
         body: comment.body,
       }));
 
@@ -1558,6 +1802,22 @@ If no actionable issues are found, return an empty issues array and explain this
 
       // Determine review event based on severity
       const event = criticalCount > 0 ? 'REQUEST_CHANGES' : 'COMMENT';
+
+      // Log detailed information about the review being posted
+      logger.info('Posting PR review with comments', {
+        owner,
+        repo,
+        prNumber,
+        commitSha: commitSha.substring(0, 7),
+        event,
+        commentsCount: reviewComments.length,
+        criticalCount,
+        commentDetails: reviewComments.map((c) => ({
+          path: c.path,
+          position: c.position,
+          bodyLength: c.body.length,
+        })),
+      });
 
       try {
         const reviewResponse = await octokit.pulls.createReview({
@@ -1641,14 +1901,14 @@ If no actionable issues are found, return an empty issues array and explain this
             pull_number: prNumber,
             commit_id: commitSha,
             path: comment.path,
-            line: comment.line,
+            position: comment.position,
             body: comment.body,
           });
 
           postedComments.push(response.data);
           logger.info('Posted individual review comment', {
             path: comment.path,
-            line: comment.line,
+            position: comment.position,
             commentId: response.data.id,
             attempt: retries + 1,
           });
@@ -1661,7 +1921,7 @@ If no actionable issues are found, return an empty issues array and explain this
             const backoffDelay = RATE_LIMIT_DELAY * Math.pow(2, retries); // Exponential backoff
             logger.warn('Rate limit hit, retrying with backoff', {
               path: comment.path,
-              line: comment.line,
+              position: comment.position,
               attempt: retries,
               delayMs: backoffDelay,
             });
@@ -1669,7 +1929,7 @@ If no actionable issues are found, return an empty issues array and explain this
           } else {
             logger.error('Failed to post individual comment after retries', {
               path: comment.path,
-              line: comment.line,
+              position: comment.position,
               error: errorMessage,
               attempts: retries,
             });
@@ -1730,12 +1990,18 @@ If no actionable issues are found, return an empty issues array and explain this
       logger.info('Review comment', {
         path: comment.path,
         line: comment.line,
+        position: comment.position,
         severity: comment.severity,
         category: comment.category,
         body: comment.body.substring(0, 200) + (comment.body.length > 200 ? '...' : ''),
       });
 
-      postedComments.push({ id: Math.random().toString(), path: comment.path, line: comment.line });
+      postedComments.push({
+        id: Math.random().toString(),
+        path: comment.path,
+        line: comment.line,
+        position: comment.position,
+      });
     }
 
     if (comments.length > 0) {
