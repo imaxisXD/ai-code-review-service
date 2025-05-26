@@ -122,13 +122,13 @@ For incremental updates:
 
 ## Environment Variables
 
-| Variable | Description | Required |
-|----------|-------------|----------|
-| `CONVEX_URL` | Convex deployment URL | Yes |
-| `CONVEX_DEPLOYMENT_KEY` | Convex deployment key | Yes |
-| `GITHUB_TOKEN` | GitHub personal access token | For private GitHub repos |
-| `OPENAI_API_KEY` | OpenAI API key | Yes |
-| `LOG_LEVEL` | Logging level (debug, info, warn, error) | No (default: info) |
+| Variable                | Description                              | Required                 |
+| ----------------------- | ---------------------------------------- | ------------------------ |
+| `CONVEX_URL`            | Convex deployment URL                    | Yes                      |
+| `CONVEX_DEPLOYMENT_KEY` | Convex deployment key                    | Yes                      |
+| `GITHUB_TOKEN`          | GitHub personal access token             | For private GitHub repos |
+| `OPENAI_API_KEY`        | OpenAI API key                           | Yes                      |
+| `LOG_LEVEL`             | Logging level (debug, info, warn, error) | No (default: info)       |
 
 ## Project Structure
 
@@ -158,3 +158,37 @@ git-repo-indexer/
 - Add support for more embedding providers
 - Implement rate limiting and queue processing for large repositories
 - Add more comprehensive test coverage
+
+## Migration to Hono
+
+This project has been migrated from Google Cloud Functions Framework to Hono, a modern, lightweight, and fast web framework for node.js and edge runtimes.
+
+### Key Changes
+
+- Replaced functions-framework with Hono
+- Implemented a modular architecture with:
+  - Middleware
+  - Handlers
+  - Routes
+- Added proper error handling
+- Improved request processing with Hono's context API
+- Enhanced logging middleware
+
+### Development
+
+To run the service locally:
+
+```bash
+# Install dependencies
+pnpm install
+
+# Start development server with hot reload
+pnpm dev
+```
+
+The server will be available at http://localhost:8080.
+
+### API Endpoints
+
+- `POST /`: Main indexing endpoint (requires authentication)
+- `GET /health`: Health check endpoint

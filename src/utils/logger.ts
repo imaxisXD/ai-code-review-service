@@ -1,57 +1,75 @@
-// src/utils/logger.ts
-interface LoggerOptions {
-  service: string;
-  level?: string;
+/* eslint-disable no-console */
+// Define allowed primitive types for log data values
+type LogDataValue = string | number | boolean | null | undefined | Error | unknown;
+
+// Define recursive type for nested objects
+type LogDataObject = {
+  [key: string]: LogDataValue | LogDataObject | Array<LogDataValue | LogDataObject>;
+};
+
+export interface LoggerTypes {
+  debug(message: string, data?: LogDataObject): void;
+  info(message: string, data?: LogDataObject): void;
+  warn(message: string, data?: LogDataObject): void;
+  error(message: string, data?: LogDataObject): void;
 }
 
-type LogLevel = 'debug' | 'info' | 'warn' | 'error';
-
-export class Logger {
-  private service: string;
-  private level: LogLevel;
-  private levels: Record<LogLevel, number> = {
-    debug: 0,
-    info: 1,
-    warn: 2,
-    error: 3,
-  };
-
-  constructor(options: LoggerOptions) {
-    this.service = options.service;
-    this.level = (options.level as LogLevel) || 'info';
+// Helper function to safely serialize error objects and unknown values
+function serializeLogData(data: LogDataValue | LogDataObject) {
+  if (data instanceof Error) {
+    return {
+      message: data.message,
+      name: data.name,
+      stack: data.stack,
+      ...(data as unknown as Record<string, unknown>),
+    };
   }
-
-  private shouldLog(level: LogLevel): boolean {
-    return this.levels[level] >= this.levels[this.level];
-  }
-
-  private formatLog(level: LogLevel, message: string, data?: Record<string, any>): string {
-    const timestamp = new Date().toISOString();
-    const dataString = data ? JSON.stringify(data) : '';
-    return `${timestamp} [${level.toUpperCase()}] [${this.service}] ${message} ${dataString}`;
-  }
-
-  public debug(message: string, data?: Record<string, any>): void {
-    if (this.shouldLog('debug')) {
-      console.debug(this.formatLog('debug', message, data));
-    }
-  }
-
-  public info(message: string, data?: Record<string, any>): void {
-    if (this.shouldLog('info')) {
-      console.info(this.formatLog('info', message, data));
-    }
-  }
-
-  public warn(message: string, data?: Record<string, any>): void {
-    if (this.shouldLog('warn')) {
-      console.warn(this.formatLog('warn', message, data));
-    }
-  }
-
-  public error(message: string, data?: Record<string, any>): void {
-    if (this.shouldLog('error')) {
-      console.error(this.formatLog('error', message, data));
-    }
-  }
+  return data;
 }
+
+function formatLog(level: string, message: string, data?: LogDataObject): string {
+  const serviceStr = '[indexing-worker]';
+
+  let dataString = '';
+  if (data) {
+    try {
+      // Use a more robust approach to handle circular references
+      const cache = new Set();
+      dataString = JSON.stringify(data, (key, value) => {
+        if (typeof value === 'object' && value !== null) {
+          // Detect circular reference
+          if (cache.has(value)) {
+            return '[Circular Reference]';
+          }
+          cache.add(value);
+        }
+        return serializeLogData(value);
+      });
+    } catch (error) {
+      dataString = JSON.stringify({
+        error: 'Error stringifying log data',
+        message: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  return `[${level}] ${serviceStr} ${message} ${dataString}`;
+}
+
+export const logger = {
+  debug(message: string, data?: LogDataObject): void {
+    console.debug(formatLog('DEBUG', message, data));
+  },
+
+  info(message: string, data?: LogDataObject): void {
+    console.info(formatLog('INFO', message, data));
+  },
+
+  warn(message: string, data?: LogDataObject): void {
+    console.warn(formatLog('WARN', message, data));
+  },
+
+  error(message: string, data?: LogDataObject): void {
+    console.error(formatLog('ERROR', message, data));
+  },
+};

@@ -1,335 +1,238 @@
-import * as functions from '@google-cloud/functions-framework';
-import path from 'path';
-import fs from 'fs/promises';
+import { Hono } from 'hono';
+import { createAuthMiddleware } from './middleware/auth.js';
+import { createLoggerMiddleware } from './middleware/logger.js';
+import { createErrorHandler } from './middleware/error-handler.js';
+import { serve } from '@hono/node-server';
+import OpenAI from 'openai';
 import { ConvexHttpClient } from 'convex/browser';
-import { GitService } from './services/git-service';
-import { EmbeddingService } from './services/embedding-service';
-import { FileProcessorService } from './services/file-processor-service';
-import { Logger } from './utils/logger';
+import { logger } from './utils/logger.js';
+import { IndexingJob, Job } from './types.js';
+import { createPubSubPublisher } from './services/pubsub-service.js';
+import { createJobProcessor } from './services/job-processor.js';
 
-// Types
-import { IndexingJob, ProcessingResult, EmbeddingChunk, IndexingStatus } from './types';
-import { api } from './convex/api';
+// --- Environment Variable Caching ---
+// Read environment variables once at startup
+const {
+  OPENAI_API_KEY,
+  CONVEX_URL,
+  SERVICE_SECRET_KEY,
+  GOOGLE_PROJECT_ID,
+  PUBSUB_TOPIC,
+  PUBSUB_SUBSCRIPTION,
+} = process.env;
 
-// Configuration
-const CONVEX_URL = process.env.CONVEX_URL as string;
-const LOG_LEVEL = process.env.LOG_LEVEL || 'info';
-
-// Initialize logger
-const logger = new Logger({
-  service: 'indexing-worker',
-  level: LOG_LEVEL,
+logger.info('Environment variables', {
+  OPENAI_API_KEY,
+  CONVEX_URL,
+  SERVICE_SECRET_KEY,
+  GOOGLE_PROJECT_ID,
+  PUBSUB_TOPIC,
+  PUBSUB_SUBSCRIPTION,
 });
 
-// Initialize services
+// Validate required environment variables
+if (!OPENAI_API_KEY) {
+  throw new Error('Missing required environment variable: OPENAI_API_KEY');
+}
+if (!CONVEX_URL) {
+  throw new Error('Missing required environment variable: CONVEX_URL');
+}
+if (!SERVICE_SECRET_KEY) {
+  throw new Error('Missing required environment variable: SERVICE_SECRET_KEY');
+}
+
+// Initialize Convex client
 const convex = new ConvexHttpClient(CONVEX_URL);
-const embeddingService = new EmbeddingService({ logger });
-const fileProcessor = new FileProcessorService({ logger });
 
-/**
- * Main HTTP Handler for repository indexing
- */
-exports.httpHandler = async (req: functions.Request, res: functions.Response) => {
-  if (req.method !== 'POST') {
-    return res.status(405).send('Method Not Allowed');
-  }
+// Initialize OpenAI client
+const openai = new OpenAI({
+  apiKey: OPENAI_API_KEY,
+});
 
-  // Parse job data
-  const jobData = req.body as IndexingJob;
-  logger.info('Received indexing job', {
-    repoId: jobData.repoId,
-    jobType: jobData.jobType,
-  });
+const pubSubService = createPubSubPublisher({
+  projectId: 'hono-backend-458311',
+  topicName: 'repo-indexing-jobs',
+});
 
-  const { repoId, userId, serviceSecretKey, jobType } = jobData;
+// Initialize job processor
+const jobProcessor = createJobProcessor({
+  convex,
+  openai,
+});
 
-  if (serviceSecretKey !== process.env.SERVICE_SECRET_KEY) {
-    logger.error('Invalid service secret key');
-    return res.status(401).json({
-      status: 'Failed',
-      error: 'Invalid service secret key',
-    });
-  }
+const app = new Hono<{ Variables: AppVariables }>();
 
-  if (!repoId) {
-    logger.error('Missing required fields', { repoId });
-    return res.status(400).json({
-      status: 'Failed',
-      error: 'Missing required fields: repoId is required',
-    });
-  }
-
-  // Get repository details
-  const repo = await convex.query(api.repositories.getRepositoryWithStringId, {
-    repositoryId: repoId,
-    userId: userId,
-  });
-
-  const cloneDir = `/tmp/repo-${repo.repositoryName}-${repo._id}-${Date.now()}`;
-
-  const effectiveGithubToken = repo.accessToken;
-
-  let processingResult: ProcessingResult | null = null;
-  let headCommit: string | null = null;
-  let beforeSha: string | undefined;
-  const cloneUrl = repo.cloneUrl;
-  try {
-    // Update status to Processing
-    await updateIndexingStatus(repoId, 'pending');
-
-    // Clone repository
-    logger.info(`Cloning repository`, { cloneUrl, cloneDir });
-    const cloneOptions = jobType === 'initial' ? ['--depth=1'] : [];
-
-    // Initialize git service with the effective token
-    const gitServiceInstance = new GitService({
-      logger,
-      githubToken: effectiveGithubToken,
-    });
-
-    const repoGit = await gitServiceInstance.cloneRepository(cloneUrl, cloneDir, cloneOptions);
-
-    // Get head commit
-    headCommit = await gitServiceInstance.getHeadCommit(repoGit);
-    logger.info('Repository cloned', { headCommit });
-
-    // For incremental indexing, get the previous commit SHA
-    if (jobType !== 'initial') {
-      try {
-        // Get the previous commit SHA using git
-        beforeSha = await repoGit.raw(['rev-parse', 'HEAD~1']);
-        beforeSha = beforeSha.trim(); // Remove any whitespace
-        logger.info('Previous commit identified', { beforeSha });
-      } catch (error) {
-        logger.warn('Failed to get previous commit, treating as initial indexing', {
-          error: error instanceof Error ? error.message : String(error),
-        });
-      }
-    }
-
-    // Determine files to process and delete
-    const { filesToProcess, filesToDelete } = await determineChanges(
-      repoGit,
-      cloneDir,
-      jobType,
-      beforeSha,
-      headCommit || '',
-      gitServiceInstance
-    );
-
-    // Process deletions
-    if (filesToDelete.length > 0) {
-      logger.info(`Deleting embeddings`, { count: filesToDelete.length });
-      // await convex.mutation(api.embeddings.deleteEmbeddingsByPathBatch, {
-      //   repositoryId: repoId,
-      //   filePaths: filesToDelete,
-      // });
-    }
-
-    // Process files
-    const processedFiles = await processFiles(cloneDir, filesToProcess, repoId, headCommit || '');
-
-    // Update last indexed SHA
-    logger.info(`Updating last indexed commit`, {
-      repoId,
-      commitSha: headCommit,
-    });
-    await convex.mutation(api.repositories.updateLastIndexedCommit, {
-      repositoryId: repoId,
-      commitSha: headCommit,
-      status: 'indexed',
-    });
-
-    processingResult = {
-      status: 'Success',
-      filesProcessed: processedFiles.length,
-      filesDeleted: filesToDelete.length,
-      commitSha: headCommit,
-    };
-  } catch (error) {
-    const errorMessage = error instanceof Error ? error.message : String(error);
-    logger.error('Processing failed', { error: errorMessage });
-
-    processingResult = {
-      status: 'Failed',
-      error: errorMessage,
-    };
-
-    // Update status to Failed
-    await updateIndexingStatus(repoId, 'failed', errorMessage);
-  } finally {
-    // Clean up cloned repository
-    await cleanupRepository(cloneDir);
-  }
-
-  // Send response
-  if (processingResult?.status === 'Success') {
-    res.status(200).json(processingResult);
-  } else {
-    res.status(500).json(processingResult || { status: 'Failed', error: 'Unknown error' });
-  }
+// Create application with typed context
+type AppVariables = {
+  requestBody: Job;
 };
 
-/**
- * Determine which files to process and delete based on job type
- */
-async function determineChanges(
-  repoGit: ReturnType<typeof GitService.prototype.getSimpleGit>,
-  cloneDir: string,
-  jobType: string,
-  beforeSha: string | undefined,
-  endSha: string,
-  gitServiceInstance: GitService
-): Promise<{ filesToProcess: string[]; filesToDelete: string[] }> {
-  let filesToProcess: string[] = [];
-  let filesToDelete: string[] = [];
+// Add error handling middleware
+app.use('*', createErrorHandler());
 
-  if (jobType === 'initial') {
-    logger.info('Initial indexing - getting all files');
-    const allFiles = await fileProcessor.getAllFilesRecursive(cloneDir);
-    filesToProcess = allFiles.filter((file: string) => fileProcessor.shouldProcessFile(file));
-  } else if (beforeSha && endSha && beforeSha !== endSha) {
-    logger.info(`Incremental indexing`, { fromSha: beforeSha, toSha: endSha });
-    const diffSummary = await gitServiceInstance.getDiffSummary(repoGit, beforeSha, endSha);
+// Add logger middleware
+app.use('*', createLoggerMiddleware());
 
-    filesToDelete = diffSummary.files
-      .map(f => (typeof f.file === 'string' ? f.file : undefined))
-      .filter((file): file is string => file !== undefined);
-
-    filesToProcess = diffSummary.files
-      .map(f => (typeof f.file === 'string' ? f.file : undefined))
-      .filter((file): file is string => file !== undefined)
-      .map(relPath => path.join(cloneDir, relPath));
-  } else {
-    logger.info('No changes detected or missing SHAs for incremental indexing');
-  }
-
-  logger.info('Changes determined', {
-    filesToProcess: filesToProcess.length,
-    filesToDelete: filesToDelete.length,
+// Health check endpoint
+app.get('/health', (c) => {
+  return c.json({
+    status: 'ok',
   });
+});
 
-  return { filesToProcess, filesToDelete };
-}
+app.post('/pubsub-push-handler', async (c) => {
+  logger.info('Received request on /pubsub-push-handler');
+  try {
+    // 1. --- Validate Pub/Sub Format ---
+    const body = await c.req.json(); // Use Hono's built-in JSON parsing
+    if (!body || !body.message || !body.message.data) {
+      const msg = 'Invalid Pub/Sub message format received.';
+      logger.error(msg, { receivedBody: body });
+      return c.text(`Bad Request: ${msg}`, 400); // Return 400 - don't retry bad format
+    }
 
-/**
- * Process files and generate embeddings
- */
-async function processFiles(
-  cloneDir: string,
-  filesToProcess: string[],
-  repoId: string,
-  commitSha: string
-): Promise<string[]> {
-  const processedFiles: string[] = [];
+    // 2. --- Decode Job Payload ---
+    const pubSubMessage = body.message;
+    let jobPayload: IndexingJob; // Use your IndexingJob type
+    try {
+      const dataBuffer = Buffer.from(pubSubMessage.data, 'base64');
+      const dataString = dataBuffer.toString('utf-8');
+      jobPayload = JSON.parse(dataString);
+      logger.info('Decoded Pub/Sub Job Payload:', { jobPayload });
+    } catch (parseError) {
+      logger.error('Failed to decode/parse Pub/Sub message data', { error: parseError });
+      return c.text('Bad Request: Invalid message data format', 400); // Return 400
+    }
 
-  logger.info(`Processing files`, { count: filesToProcess.length });
-
-  // Process in batches to avoid memory issues
-  const BATCH_SIZE = 20;
-  for (let i = 0; i < filesToProcess.length; i += BATCH_SIZE) {
-    const batch = filesToProcess.slice(i, i + BATCH_SIZE);
-    await Promise.all(
-      batch.map(async fullFilePath => {
-        try {
-          // Check if file exists and is not a directory
-          const stats = await fs.stat(fullFilePath).catch(() => null);
-          if (!stats || !stats.isFile()) return;
-
-          const relativePath = path.relative(cloneDir, fullFilePath);
-          logger.info(`Processing file`, { path: relativePath });
-
-          // Parse file into chunks
-          const chunks = await fileProcessor.parseAndChunkFile(fullFilePath);
-
-          // Process each chunk
-          for (const chunk of chunks) {
-            // Generate embedding
-            const embedding = await embeddingService.generateEmbedding(chunk.codeChunkText);
-
-            // Store embedding
-            await storeEmbedding(chunk, embedding, relativePath, repoId, commitSha);
-          }
-
-          processedFiles.push(relativePath);
-        } catch (error) {
-          const errorMessage = error instanceof Error ? error.message : String(error);
-          logger.error(`Failed to process file`, {
-            path: fullFilePath,
-            error: errorMessage,
-          });
-          // Continue with other files
-        }
-      })
+    // 3. --- Process the Job ---
+    logger.info(
+      `Starting job processing for repoId: ${jobPayload.repoId}, type: ${jobPayload.jobType}`
     );
+    try {
+      await jobProcessor.processJob(jobPayload as Job); // Call your core logic
+      logger.info(`Finished job processing successfully for repoId: ${jobPayload.repoId}`);
+    } catch (error) {
+      logger.error('Error processing job', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return c.text('Internal Server Error: Job processing failed', 500);
+    }
+
+    // 4. --- Acknowledge Pub/Sub Message ---
+    // Return 2xx status code to signal success to Pub/Sub
+    return c.body(null, 204); // 204 No Content is appropriate
+  } catch (processingError) {
+    const errorMessage =
+      processingError instanceof Error ? processingError.message : String(processingError);
+    logger.error('Error processing job received from Pub/Sub', { error: errorMessage });
+
+    // 5. --- Signal Failure to Pub/Sub ---
+    // Return non-2xx (e.g., 500) to make Pub/Sub retry the message
+    // based on the subscription's retry policy.
+    // Be careful: if the error is permanent, this could lead to infinite retries
+    // polluting the DLQ. Add logic here to maybe return 2xx for permanent errors
+    // if you want them sent directly to the DLQ after first failure.
+    return c.text('Internal Server Error: Job processing failed', 500);
   }
+});
 
-  return processedFiles;
-}
-
-/**
- * Store embedding in Convex database
- */
-async function storeEmbedding(
-  chunk: EmbeddingChunk,
-  embedding: number[],
-  filePath: string,
-  repositoryId: string,
-  commitSha: string
-): Promise<void> {
-  // Call the Convex mutation with the required arguments
-  await convex.mutation(api.embeddings.storeEmbedding, {
-    embedding,
-    repositoryId: repositoryId,
-    filePath,
-    startLine: chunk.startLine,
-    endLine: chunk.endLine,
-    language: chunk.language,
-    chunkType: chunk.chunkType,
-    symbolName: chunk.symbolName ?? undefined,
-    commitSha,
-  });
-}
-
-/**
- * Update indexing status in database
- */
-async function updateIndexingStatus(
-  repositoryId: string,
-  status: IndexingStatus,
-  error?: string
-): Promise<void> {
+// Apply auth middleware to protected routes - Pass cached secret key
+app.all('/indexing-job', createAuthMiddleware(), async (c) => {
   try {
-    await convex.mutation(api.repositories.updateIndexingStatus, {
-      repositoryId,
-      status,
+    // Get the already parsed body from the context
+    const parsedBody = c.get('requestBody');
+    logger.info('Parsed body after auth middleware', {
+      parsedBody,
+      repoId: parsedBody.repoId,
+      jobType: parsedBody.jobType,
+      userId: parsedBody.userId,
     });
-  } catch (dbError) {
-    logger.error('Failed to update status in database' + error, {
-      repositoryId,
-      status,
-      error: dbError instanceof Error ? dbError.message : String(dbError),
-    });
-  }
-}
 
-/**
- * Clean up repository directory
- */
-async function cleanupRepository(cloneDir: string): Promise<void> {
-  logger.info(`Cleaning up repository`, { cloneDir });
-  try {
-    await fs.access(cloneDir).then(
-      async () => {
-        await fs.rm(cloneDir, { recursive: true, force: true });
-        logger.info('Repository cleanup successful');
+    // Now you can access the data
+    const { repoId, jobType, userId } = parsedBody;
+
+    if (!repoId) {
+      logger.error('Missing required fields', { repoId });
+      return c.json(
+        {
+          status: 'Failed',
+          error: 'Missing required fields: repoId is required',
+        },
+        400
+      );
+    }
+    if (!userId) {
+      logger.error('Missing required fields', { userId });
+      return c.json(
+        {
+          status: 'Failed',
+          error: 'Missing required fields: userId is required',
+        },
+        400
+      );
+    }
+    if (typeof repoId !== 'string' || typeof userId !== 'string' || typeof jobType !== 'string') {
+      return c.json(
+        {
+          status: 'Failed',
+          error: 'Invalid request body: repoId, userId, and jobType must be strings',
+        },
+        400
+      );
+    }
+
+    // Validate job type
+    if (!['initial', 'incremental', 'pr_review'].includes(jobType)) {
+      return c.json(
+        {
+          status: 'Failed',
+          error: 'Invalid jobType. Must be initial, incremental, or pr_review',
+        },
+        400
+      );
+    }
+
+    logger.info('Queueing indexing job', { repoId, userId, jobType });
+
+    try {
+      // Publish the job to Pub/Sub
+      const messageId = await pubSubService.publishMessage(parsedBody);
+
+      // Return success response
+      return c.json({
+        status: 'Queued',
+        messageId,
+      });
+    } catch (pubsubError) {
+      logger.error('Error publishing to Pub/Sub', {
+        error: pubsubError instanceof Error ? pubsubError.message : String(pubsubError),
+      });
+      return c.json(
+        {
+          status: 'Failed',
+          error: 'Failed to queue indexing job',
+        },
+        500
+      );
+    }
+  } catch (error) {
+    logger.error('Error processing indexing job', {
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return c.json(
+      {
+        status: 'Failed',
+        error: 'An error occurred while processing the indexing job',
       },
-      () => logger.info('No cleanup needed, directory does not exist')
+      500
     );
-  } catch (cleanupError) {
-    logger.error('Repository cleanup failed', {
-      cloneDir,
-      error: cleanupError instanceof Error ? cleanupError.message : String(cleanupError),
-    });
   }
-}
+});
+
+// Method not allowed for other methods on root path
+app.all('/', (c) => c.text('Method Not Allowed', 405));
+
+serve({
+  fetch: app.fetch,
+  port: 8080,
+});
