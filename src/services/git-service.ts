@@ -69,18 +69,24 @@ export function createGitService(options: GitOptions) {
     const git = createSimpleGit({
       baseDir,
       binary: 'git',
-      config: [],
+      config: ['core.quotepath=false', 'diff.noprefix=false', 'log.showSignature=false'],
       trimmed: false,
     });
 
     // Configure output handler to suppress verbose git output
     git.outputHandler((command, stdout, stderr) => {
-      // Suppress stdout to reduce log noise from diff commands
-      // Only log stderr if there are actual errors
+      // Suppress stdout completely to reduce log noise from diff commands
+      if (stdout) {
+        stdout.on('data', () => {
+          // Silently consume stdout data to prevent it from being logged
+        });
+      }
+
+      // Only log stderr if there are actual errors (not warnings)
       if (stderr) {
         stderr.on('data', (data) => {
           const errorText = data.toString().trim();
-          if (errorText && !errorText.includes('warning:')) {
+          if (errorText && !errorText.includes('warning:') && !errorText.includes('hint:')) {
             logger.debug('Git stderr', { command, error: errorText });
           }
         });
@@ -137,16 +143,87 @@ export function createGitService(options: GitOptions) {
    * Get diff summary between two commits
    */
   async function getDiffSummary(git: SimpleGit, fromSha: string, toSha: string) {
-    logger.debug('Getting diff summary', { fromSha, toSha });
-    return await git.diffSummary([`${fromSha}..${toSha}`]);
+    try {
+      // Validate inputs
+      if (!fromSha || !toSha) {
+        throw new Error(`Invalid parameters: fromSha=${fromSha}, toSha=${toSha}`);
+      }
+
+      // Validate that both SHAs exist
+      try {
+        await git.raw(['rev-parse', '--verify', fromSha]);
+        await git.raw(['rev-parse', '--verify', toSha]);
+      } catch (error) {
+        throw new Error(
+          `Invalid commit SHA: ${error instanceof Error ? error.message : String(error)}`
+        );
+      }
+
+      logger.debug('Getting diff summary', {
+        fromSha: fromSha.substring(0, 7),
+        toSha: toSha.substring(0, 7),
+      });
+
+      return await git.diffSummary([`${fromSha}..${toSha}`]);
+    } catch (error) {
+      logger.error('Failed to get diff summary', {
+        fromSha: fromSha?.substring(0, 7),
+        toSha: toSha?.substring(0, 7),
+        error: error instanceof Error ? error.message : String(error),
+      });
+
+      // Return empty diff summary to allow processing to continue
+      return {
+        changed: 0,
+        deletions: 0,
+        insertions: 0,
+        files: [],
+      };
+    }
   }
 
   /**
    * Get file diff with suppressed output
    */
   async function getFileDiff(git: SimpleGit, fromSha: string, toSha: string, filePath: string) {
-    // Use raw git command with --quiet to suppress verbose output
-    return await git.raw(['diff', `${fromSha}..${toSha}`, '--', filePath]);
+    try {
+      // Validate inputs
+      if (!fromSha || !toSha || !filePath) {
+        throw new Error(
+          `Invalid parameters: fromSha=${fromSha}, toSha=${toSha}, filePath=${filePath}`
+        );
+      }
+
+      // Validate that both SHAs exist
+      try {
+        await git.raw(['rev-parse', '--verify', fromSha]);
+        await git.raw(['rev-parse', '--verify', toSha]);
+      } catch (error) {
+        throw new Error(
+          `Invalid commit SHA: ${error instanceof Error ? error.message : String(error)}`
+        );
+      }
+
+      // Use raw git command with flags to suppress verbose output
+      return await git.raw([
+        'diff',
+        '--no-color',
+        '--no-stat',
+        `${fromSha}..${toSha}`,
+        '--',
+        filePath,
+      ]);
+    } catch (error) {
+      logger.error('Failed to get file diff', {
+        fromSha: fromSha?.substring(0, 7),
+        toSha: toSha?.substring(0, 7),
+        filePath,
+        error: error instanceof Error ? error.message : String(error),
+      });
+
+      // Return empty diff instead of throwing to allow processing to continue
+      return '';
+    }
   }
 
   /**

@@ -14,10 +14,12 @@
         "test": "jest"
     },
     "dependencies": {
+        "@ai-sdk/anthropic": "^1.2.12",
         "@google-cloud/pubsub": "^5.0.0",
         "@hono/node-server": "^1.14.1",
         "@octokit/auth-app": "^8.0.1",
         "@octokit/rest": "^21.1.1",
+        "ai": "^4.3.16",
         "axios": "^1.5.0",
         "convex": "^1.23.0",
         "hono": "^4.7.8",
@@ -27,7 +29,8 @@
         "tree-sitter-java": "^0.23.5",
         "tree-sitter-javascript": "^0.23.1",
         "tree-sitter-json": "^0.24.8",
-        "tree-sitter-typescript": "^0.23.2"
+        "tree-sitter-typescript": "^0.23.2",
+        "zod": "^3.25.28"
     },
     "devDependencies": {
         "@types/jest": "^29.5.4",

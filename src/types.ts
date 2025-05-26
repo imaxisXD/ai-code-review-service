@@ -47,6 +47,7 @@ export interface PullRequestReviewResult {
 export interface ReviewComment {
   path: string;
   line: number;
+  position?: number; // GitHub diff position (for PR reviews)
   body: string;
   severity: 'info' | 'warning' | 'error';
   category: string;

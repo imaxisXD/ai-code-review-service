@@ -102,10 +102,20 @@ export function createJobProcessor(deps: { convex: ConvexHttpClient; openai: Ope
       let beforeSha = '';
       if (jobType !== 'initial') {
         try {
-          // Get the previous commit SHA using git
-          beforeSha = await repoGit.raw(['rev-parse', 'HEAD~1']);
-          beforeSha = beforeSha.trim(); // Remove any whitespace
-          logger.info('Previous commit identified', { beforeSha });
+          // First check if there are at least 2 commits
+          const commitCount = await repoGit.raw(['rev-list', '--count', 'HEAD']);
+          const count = parseInt(commitCount.trim());
+
+          if (count > 1) {
+            // Get the previous commit SHA using git
+            beforeSha = await repoGit.raw(['rev-parse', 'HEAD~1']);
+            beforeSha = beforeSha.trim(); // Remove any whitespace
+            logger.info('Previous commit identified', { beforeSha, commitCount: count });
+          } else {
+            logger.info('Repository has only one commit, treating as initial indexing', {
+              commitCount: count,
+            });
+          }
         } catch (error) {
           logger.warn('Failed to get previous commit, treating as initial indexing', {
             error: error instanceof Error ? error.message : String(error),
