@@ -4,7 +4,6 @@ import { createGitService } from './git-service.js';
 import { api } from '../convex/api.js';
 import { logger } from '../utils/logger.js';
 import { PullRequestReviewJob, ReviewComment, PullRequestReviewResult } from '../types.js';
-// SimpleGit import removed - now using GitHub API instead of git operations
 import { createAppAuth } from '@octokit/auth-app';
 import { Octokit } from '@octokit/rest';
 import { anthropic } from '@ai-sdk/anthropic';
@@ -747,7 +746,8 @@ export function createPullRequestReviewService(deps: {
         }),
         owner,
         repo,
-        prNumber
+        prNumber,
+        commitSha
       );
 
       if (changedFiles.length === 0) {
@@ -843,13 +843,44 @@ export function createPullRequestReviewService(deps: {
   }
 
   /**
+   * Reconstruct file content from a GitHub patch (for new files)
+   */
+  function reconstructContentFromPatch(patch: string): string {
+    const lines = patch.split('\n');
+    const contentLines: string[] = [];
+
+    for (const line of lines) {
+      // Skip patch headers
+      if (
+        line.startsWith('diff --git') ||
+        line.startsWith('index ') ||
+        line.startsWith('---') ||
+        line.startsWith('+++') ||
+        line.startsWith('@@') ||
+        line.startsWith('new file mode') ||
+        line.startsWith('deleted file mode')
+      ) {
+        continue;
+      }
+
+      // For new files, all content lines start with '+'
+      if (line.startsWith('+')) {
+        contentLines.push(line.substring(1)); // Remove the '+' prefix
+      }
+    }
+
+    return contentLines.join('\n');
+  }
+
+  /**
    * Extract changed files using GitHub API instead of git operations
    */
   async function extractChangedFilesFromGitHub(
     octokit: Octokit,
     owner: string,
     repo: string,
-    prNumber: number
+    prNumber: number,
+    commitSha: string
   ) {
     try {
       logger.info('Fetching PR files from GitHub API', { owner, repo, prNumber });
@@ -889,23 +920,46 @@ export function createPullRequestReviewService(deps: {
         try {
           // Get file content from GitHub API
           let content = '';
+          let contentFetchFailed = false;
           try {
             const { data: fileData } = await octokit.rest.repos.getContent({
               owner,
               repo,
               path: file.filename,
-              ref: 'HEAD', // Get the latest version
+              ref: commitSha, // Get the version from the specific commit
             });
 
             if ('content' in fileData && fileData.content) {
               content = Buffer.from(fileData.content, 'base64').toString('utf8');
             }
           } catch (error) {
-            logger.warn('Could not fetch file content from GitHub API', {
-              filename: file.filename,
-              error: error instanceof Error ? error.message : String(error),
-            });
-            continue;
+            contentFetchFailed = true;
+            logger.warn(
+              'Could not fetch file content from GitHub API, will try to reconstruct from patch',
+              {
+                filename: file.filename,
+                error: error instanceof Error ? error.message : String(error),
+              }
+            );
+
+            // Try to reconstruct content from patch for new files
+            if (file.status === 'added' && file.patch) {
+              content = reconstructContentFromPatch(file.patch);
+              if (content) {
+                logger.info('Successfully reconstructed content from patch', {
+                  filename: file.filename,
+                  contentLength: content.length,
+                });
+                contentFetchFailed = false;
+              }
+            }
+
+            if (contentFetchFailed) {
+              logger.warn('Skipping file due to content fetch failure', {
+                filename: file.filename,
+              });
+              continue;
+            }
           }
 
           // Skip binary files
@@ -948,6 +1002,7 @@ export function createPullRequestReviewService(deps: {
             originalContent: content,
             annotatedContent,
             patch: file.patch, // GitHub patch format
+            diff: file.patch, // Add diff property for compatibility
             language,
             diffAnalysis,
             commentLines,
@@ -993,6 +1048,7 @@ export function createPullRequestReviewService(deps: {
     addedLines: Set<number>;
     deletedLines: Set<number>;
     validDiffPositions: Set<number>; // GitHub diff positions (not line numbers)
+    validDiffLines: Set<number>; // Line numbers that are valid for comments
     lineToPositionMap: Map<number, number>; // Maps line numbers to diff positions
     positionToLineMap: Map<number, number>; // Maps diff positions to line numbers
   } {
@@ -1000,6 +1056,7 @@ export function createPullRequestReviewService(deps: {
     const addedLines = new Set<number>();
     const deletedLines = new Set<number>();
     const validDiffPositions = new Set<number>();
+    const validDiffLines = new Set<number>();
     const lineToPositionMap = new Map<number, number>();
     const positionToLineMap = new Map<number, number>();
 
@@ -1037,6 +1094,7 @@ export function createPullRequestReviewService(deps: {
         addedLines.add(currentNewLine);
         changedLines.add(currentNewLine);
         validDiffPositions.add(diffPosition);
+        validDiffLines.add(currentNewLine);
         lineToPositionMap.set(currentNewLine, diffPosition);
         positionToLineMap.set(diffPosition, currentNewLine);
         currentNewLine++;
@@ -1050,6 +1108,7 @@ export function createPullRequestReviewService(deps: {
         // Context line (unchanged) - these can be commented on
         diffPosition++;
         validDiffPositions.add(diffPosition);
+        validDiffLines.add(currentNewLine);
         lineToPositionMap.set(currentNewLine, diffPosition);
         positionToLineMap.set(diffPosition, currentNewLine);
         currentNewLine++;
@@ -1068,6 +1127,7 @@ export function createPullRequestReviewService(deps: {
       addedLines,
       deletedLines,
       validDiffPositions,
+      validDiffLines,
       lineToPositionMap,
       positionToLineMap,
     };
@@ -1134,11 +1194,12 @@ export function createPullRequestReviewService(deps: {
       try {
         logger.info('Analyzing file for review', {
           path: file.path,
-          validDiffLines: file.diffAnalysis.validDiffLines.size,
+          validDiffLines: file.diffAnalysis?.validDiffLines?.size || 0,
         });
 
         // Store valid diff lines for this file
-        fileValidDiffLines.set(file.path, file.diffAnalysis.validDiffLines);
+        const validDiffLines = file.diffAnalysis?.validDiffLines || new Set<number>();
+        fileValidDiffLines.set(file.path, validDiffLines);
 
         // Get context for this file using existing embeddings
         const similarCode = await getSimilarCodeContext(file, repository._id);
@@ -1150,7 +1211,7 @@ export function createPullRequestReviewService(deps: {
         const fileComments = convertAnalysisToComments(
           analysis.issues || [],
           file.path,
-          file.diffAnalysis.lineToPositionMap
+          file.diffAnalysis?.lineToPositionMap || new Map<number, number>()
         );
 
         // Limit comments per file to avoid overwhelming developers
@@ -1264,15 +1325,16 @@ export function createPullRequestReviewService(deps: {
 
     // Determine change type based on diff content
     let changeType = 'unknown';
-    if (file.diff.includes('+++') && file.diff.includes('---')) {
-      if (file.diff.includes('new file') || file.diff.includes('index 0000000..0000000')) {
+    const diffContent = file.diff || file.patch || '';
+    if (diffContent.includes('+++') && diffContent.includes('---')) {
+      if (diffContent.includes('new file') || diffContent.includes('index 0000000..0000000')) {
         changeType = 'new file';
-      } else if (file.diff.includes('deleted file')) {
+      } else if (diffContent.includes('deleted file')) {
         changeType = 'deleted file';
       } else {
         changeType = 'modification';
       }
-    } else if (file.diff.includes('@@ -0,0 +1,')) {
+    } else if (diffContent.includes('@@ -0,0 +1,')) {
       // This is likely our synthetic diff for a new/modified file
       changeType = 'file review (no diff available)';
     }
@@ -1351,7 +1413,7 @@ Now, examine the code changes:
 
 <code_diff>
 \`\`\`diff
-${file.diff}
+${diffContent}
 \`\`\`
 </code_diff>
 
