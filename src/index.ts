@@ -82,6 +82,9 @@ app.get('/health', (c) => {
 
 app.post('/pubsub-push-handler', async (c) => {
   logger.info('Received request on /pubsub-push-handler');
+
+  let jobPayload: IndexingJob | null = null;
+
   try {
     // 1. --- Validate Pub/Sub Format ---
     const body = await c.req.json(); // Use Hono's built-in JSON parsing
@@ -93,7 +96,6 @@ app.post('/pubsub-push-handler', async (c) => {
 
     // 2. --- Decode Job Payload ---
     const pubSubMessage = body.message;
-    let jobPayload: IndexingJob; // Use your IndexingJob type
     try {
       const dataBuffer = Buffer.from(pubSubMessage.data, 'base64');
       const dataString = dataBuffer.toString('utf-8');
@@ -105,34 +107,66 @@ app.post('/pubsub-push-handler', async (c) => {
     }
 
     // 3. --- Process the Job ---
+    if (!jobPayload) {
+      logger.error('Job payload is null after parsing');
+      return c.text('Bad Request: Invalid job payload', 400);
+    }
+
     logger.info(
       `Starting job processing for repoId: ${jobPayload.repoId}, type: ${jobPayload.jobType}`
     );
-    try {
-      await jobProcessor.processJob(jobPayload as Job); // Call your core logic
-      logger.info(`Finished job processing successfully for repoId: ${jobPayload.repoId}`);
-    } catch (error) {
-      logger.error('Error processing job', {
-        error: error instanceof Error ? error.message : String(error),
-      });
-      return c.text('Internal Server Error: Job processing failed', 500);
-    }
 
-    // 4. --- Acknowledge Pub/Sub Message ---
-    // Return 2xx status code to signal success to Pub/Sub
-    return c.body(null, 204); // 204 No Content is appropriate
+    let jobResult: any = null;
+    try {
+      jobResult = await jobProcessor.processJob(jobPayload as Job); // Call your core logic
+      logger.info(`Finished job processing successfully for repoId: ${jobPayload.repoId}`, {
+        result: jobResult,
+      });
+
+      // 4. --- Acknowledge Pub/Sub Message on Success ---
+      // Return 2xx status code to signal success to Pub/Sub
+      return c.body(null, 204); // 204 No Content is appropriate
+    } catch (jobError) {
+      const jobErrorMessage = jobError instanceof Error ? jobError.message : String(jobError);
+      logger.error('Error processing job', {
+        repoId: jobPayload.repoId,
+        jobType: jobPayload.jobType,
+        error: jobErrorMessage,
+      });
+
+      // Check if this is a retryable error or permanent failure
+      const isRetryableError =
+        jobErrorMessage.toLowerCase().includes('overload') ||
+        jobErrorMessage.toLowerCase().includes('rate limit') ||
+        jobErrorMessage.toLowerCase().includes('timeout') ||
+        jobErrorMessage.includes('529') ||
+        jobErrorMessage.includes('503');
+
+      if (isRetryableError) {
+        logger.warn('Retryable error detected, signaling Pub/Sub to retry', {
+          repoId: jobPayload.repoId,
+          error: jobErrorMessage,
+        });
+        return c.text('Retryable Error: Job processing failed temporarily', 500);
+      } else {
+        logger.error('Permanent error detected, acknowledging message to prevent retry loop', {
+          repoId: jobPayload.repoId,
+          error: jobErrorMessage,
+        });
+        // Return 2xx to prevent infinite retries for permanent errors
+        return c.text('Permanent Error: Job processing failed permanently', 200);
+      }
+    }
   } catch (processingError) {
     const errorMessage =
       processingError instanceof Error ? processingError.message : String(processingError);
-    logger.error('Error processing job received from Pub/Sub', { error: errorMessage });
+    logger.error('Error processing Pub/Sub message', {
+      error: errorMessage,
+      repoId: jobPayload?.repoId || 'unknown',
+    });
 
-    // 5. --- Signal Failure to Pub/Sub ---
-    // Return non-2xx (e.g., 500) to make Pub/Sub retry the message
-    // based on the subscription's retry policy.
-    // Be careful: if the error is permanent, this could lead to infinite retries
-    // polluting the DLQ. Add logic here to maybe return 2xx for permanent errors
-    // if you want them sent directly to the DLQ after first failure.
-    return c.text('Internal Server Error: Job processing failed', 500);
+    // For parsing/validation errors, don't retry
+    return c.text('Bad Request: Message processing failed', 400);
   }
 });
 

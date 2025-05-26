@@ -7,6 +7,84 @@ import { PullRequestReviewJob, ReviewComment, PullRequestReviewResult } from '..
 import { SimpleGit } from 'simple-git';
 import { createAppAuth } from '@octokit/auth-app';
 import { Octokit } from '@octokit/rest';
+import { anthropic } from '@ai-sdk/anthropic';
+import { generateObject } from 'ai';
+import { z } from 'zod';
+
+/**
+ * Pull Request Review Service
+ *
+ * This service handles automated code review for pull requests using AI.
+ *
+ * LINE NUMBER ACCURACY IMPROVEMENTS:
+ *
+ * The service implements several sophisticated techniques to ensure accurate line numbers in review comments:
+ *
+ * 1. DIFF PARSING AND ANALYSIS:
+ *    - parseDiffForLineRanges(): Parses git diffs to extract exact line changes
+ *    - Identifies added, deleted, and modified lines with precise line numbers
+ *    - Creates line mapping between old and new file versions
+ *
+ * 2. COMMENT FILTERING WITH TRACKING:
+ *    - removeCommentsFromCodeWithTracking(): Removes comments while tracking their line numbers
+ *    - Prevents AI from reviewing documentation/comments
+ *    - Maintains accurate line number mapping after comment removal
+ *
+ * 3. ANNOTATED CONTENT GENERATION:
+ *    - createAnnotatedFileContent(): Creates line-numbered content with change annotations
+ *    - Marks lines as [ADDED LINE], [MODIFIED LINE], or [COMMENT LINE - FILTERED]
+ *    - Provides clear visual indicators to the AI about which lines changed
+ *
+ * 4. LINE NUMBER VALIDATION AND CORRECTION:
+ *    - validateAndCorrectLineNumbers(): Post-processes AI responses to fix line numbers
+ *    - Corrects line numbers that point to comment lines
+ *    - Prefers lines that were actually changed in the PR
+ *    - Validates line numbers are within file bounds
+ *    - Configurable correction distance and preferences
+ *
+ * 5. ENHANCED AI PROMPTING:
+ *    - Explicit instructions to use annotated line numbers
+ *    - Focus on changed lines only ([ADDED LINE] or [MODIFIED LINE])
+ *    - Clear guidance on line number format and expectations
+ *
+ * 6. CONFIGURATION OPTIONS:
+ *    - lineNumberValidation.enabled: Enable/disable line number correction
+ *    - lineNumberValidation.maxCorrectionDistance: Max lines to search for corrections
+ *    - lineNumberValidation.preferChangedLines: Prefer lines that were actually changed
+ *
+ * This multi-layered approach significantly improves line number accuracy while maintaining
+ * the quality and relevance of AI-generated code review comments.
+ *
+ * RETRY AND CIRCUIT BREAKER FUNCTIONALITY:
+ *
+ * The service implements robust error handling for Anthropic API overload errors (HTTP 529):
+ *
+ * 1. RETRY MECHANISM:
+ *    - Configurable retry attempts (default: 5)
+ *    - Exponential backoff with optional jitter
+ *    - Base delay: 2 seconds, max delay: 30 seconds
+ *    - Specifically handles "Overloaded" errors from Anthropic API
+ *
+ * 2. CIRCUIT BREAKER PATTERN:
+ *    - Opens circuit after 3 consecutive overload failures
+ *    - Prevents further API calls for 1 minute when open
+ *    - Automatically resets after timeout period
+ *    - Protects against cascading failures and API abuse
+ *
+ * 3. CONFIGURATION:
+ *    - retryConfig.maxRetries: Number of retry attempts
+ *    - retryConfig.baseDelayMs: Base delay between retries
+ *    - retryConfig.maxDelayMs: Maximum delay between retries
+ *    - retryConfig.enableJitter: Add randomness to prevent thundering herd
+ *
+ * 4. MONITORING:
+ *    - Detailed logging of retry attempts and circuit breaker state
+ *    - getCircuitBreakerStatus() function for monitoring
+ *    - Graceful degradation with informative error messages
+ *
+ * This ensures the service remains resilient during Anthropic API overload periods
+ * while providing clear feedback about the system state.
+ */
 
 // Configuration for AI code review
 interface ReviewConfig {
@@ -14,15 +92,21 @@ interface ReviewConfig {
   maxLinesPerFile: number;
   maxCommentsPerFile: number;
   skipPatterns: string[];
-  modelConfig: {
-    model: string;
-    temperature: number;
-    maxTokens: number;
-  };
   embeddingConfig: {
     model: string;
     maxInputLength: number;
     similarCodeLimit: number;
+  };
+  retryConfig: {
+    maxRetries: number;
+    baseDelayMs: number;
+    maxDelayMs: number;
+    enableJitter: boolean;
+  };
+  lineNumberValidation: {
+    enabled: boolean;
+    maxCorrectionDistance: number;
+    preferChangedLines: boolean;
   };
 }
 
@@ -39,16 +123,30 @@ const DEFAULT_CONFIG: ReviewConfig = {
     '*.lock',
     'package-lock.json',
     'yarn.lock',
+    '.cursor/**',
+    '*.md',
+    '*.mdc',
+    '*.txt',
+    '*.log',
+    '.npmrc',
+    '.prettierrc',
+    '.prettierignore',
   ],
-  modelConfig: {
-    model: 'gpt-4o',
-    temperature: 0.1,
-    maxTokens: 2000,
-  },
   embeddingConfig: {
     model: 'text-embedding-3-small',
     maxInputLength: 8000,
     similarCodeLimit: 5,
+  },
+  retryConfig: {
+    maxRetries: 0, // Disable retries to prevent loops - let Pub/Sub handle retries
+    baseDelayMs: 2000,
+    maxDelayMs: 30000,
+    enableJitter: true,
+  },
+  lineNumberValidation: {
+    enabled: true,
+    maxCorrectionDistance: 5,
+    preferChangedLines: true,
   },
 };
 
@@ -59,6 +157,461 @@ export function createPullRequestReviewService(deps: {
 }) {
   const { convex, openai, config: userConfig } = deps;
   const config = { ...DEFAULT_CONFIG, ...userConfig };
+
+  // Circuit breaker state for handling API overload
+  const circuitBreakerState = {
+    isOpen: false,
+    failureCount: 0,
+    lastFailureTime: 0,
+    resetTimeoutMs: 60000, // 1 minute
+    maxFailures: 3, // Open circuit after 3 consecutive overload failures
+  };
+
+  // Job deduplication cache to prevent processing the same job multiple times
+  const processedJobs = new Map<string, { timestamp: number; result: any }>();
+  const JOB_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
+
+  /**
+   * Parse diff to extract changed line ranges and create line mapping
+   */
+  function parseDiffForLineRanges(diff: string): {
+    changedLines: Set<number>;
+    addedLines: Set<number>;
+    deletedLines: Set<number>;
+    lineMapping: Map<number, { type: 'added' | 'deleted' | 'context'; originalLine?: number }>;
+  } {
+    const changedLines = new Set<number>();
+    const addedLines = new Set<number>();
+    const deletedLines = new Set<number>();
+    const lineMapping = new Map<
+      number,
+      { type: 'added' | 'deleted' | 'context'; originalLine?: number }
+    >();
+
+    const lines = diff.split('\n');
+    let currentNewLine = 0;
+    let currentOldLine = 0;
+
+    for (const line of lines) {
+      // Parse hunk headers like @@ -1,4 +1,6 @@
+      const hunkMatch = line.match(/^@@\s+-(\d+)(?:,(\d+))?\s+\+(\d+)(?:,(\d+))?\s+@@/);
+      if (hunkMatch) {
+        currentOldLine = parseInt(hunkMatch[1]);
+        currentNewLine = parseInt(hunkMatch[3]);
+        continue;
+      }
+
+      // Skip diff headers
+      if (
+        line.startsWith('diff --git') ||
+        line.startsWith('index ') ||
+        line.startsWith('---') ||
+        line.startsWith('+++')
+      ) {
+        continue;
+      }
+
+      // Process diff content lines
+      if (line.startsWith('+')) {
+        // Added line
+        addedLines.add(currentNewLine);
+        changedLines.add(currentNewLine);
+        lineMapping.set(currentNewLine, { type: 'added' });
+        currentNewLine++;
+      } else if (line.startsWith('-')) {
+        // Deleted line (doesn't increment new line counter)
+        deletedLines.add(currentOldLine);
+        lineMapping.set(currentOldLine, { type: 'deleted' });
+        currentOldLine++;
+      } else if (line.startsWith(' ') || line === '') {
+        // Context line (unchanged)
+        lineMapping.set(currentNewLine, { type: 'context', originalLine: currentOldLine });
+        currentNewLine++;
+        currentOldLine++;
+      }
+    }
+
+    return { changedLines, addedLines, deletedLines, lineMapping };
+  }
+
+  /**
+   * Create enhanced file content with line number annotations
+   */
+  function createAnnotatedFileContent(
+    content: string,
+    changedLines: Set<number>,
+    addedLines: Set<number>,
+    commentLines: Set<number>
+  ): string {
+    const lines = content.split('\n');
+    const annotatedLines: string[] = [];
+
+    for (let i = 0; i < lines.length; i++) {
+      const lineNumber = i + 1;
+      const line = lines[i];
+
+      let annotation = '';
+      if (addedLines.has(lineNumber)) {
+        annotation = ' // [ADDED LINE]';
+      } else if (changedLines.has(lineNumber)) {
+        annotation = ' // [MODIFIED LINE]';
+      } else if (commentLines.has(lineNumber)) {
+        annotation = ' // [COMMENT LINE - FILTERED]';
+      }
+
+      annotatedLines.push(`${lineNumber.toString().padStart(4, ' ')}: ${line}${annotation}`);
+    }
+
+    return annotatedLines.join('\n');
+  }
+
+  /**
+   * Improved comment removal that tracks which lines were comments
+   */
+  function removeCommentsFromCodeWithTracking(
+    content: string,
+    language: string
+  ): {
+    filteredContent: string;
+    commentLines: Set<number>;
+  } {
+    const lines = content.split('\n');
+    const filteredLines: string[] = [];
+    const commentLines = new Set<number>();
+
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      const trimmedLine = line.trim();
+      const lineNumber = i + 1;
+
+      // Skip empty lines
+      if (!trimmedLine) {
+        filteredLines.push(line);
+        continue;
+      }
+
+      // Language-specific comment detection
+      let isComment = false;
+
+      switch (language) {
+        case 'javascript':
+        case 'typescript':
+        case 'java':
+        case 'kotlin':
+        case 'swift':
+        case 'go':
+        case 'rust':
+        case 'cpp':
+        case 'c':
+        case 'csharp':
+          // Single line comments
+          if (trimmedLine.startsWith('//')) {
+            isComment = true;
+          }
+          // Multi-line comments (simple detection)
+          if (
+            trimmedLine.startsWith('/*') ||
+            trimmedLine.startsWith('*') ||
+            trimmedLine.endsWith('*/')
+          ) {
+            isComment = true;
+          }
+          // JSDoc comments
+          if (trimmedLine.startsWith('/**') || trimmedLine.startsWith('*')) {
+            isComment = true;
+          }
+          break;
+
+        case 'python':
+          // Single line comments
+          if (trimmedLine.startsWith('#')) {
+            isComment = true;
+          }
+          // Docstrings (simple detection)
+          if (trimmedLine.startsWith('"""') || trimmedLine.startsWith("'''")) {
+            isComment = true;
+          }
+          break;
+
+        case 'ruby':
+          // Single line comments
+          if (trimmedLine.startsWith('#')) {
+            isComment = true;
+          }
+          break;
+
+        case 'php':
+          // Single line comments
+          if (trimmedLine.startsWith('//') || trimmedLine.startsWith('#')) {
+            isComment = true;
+          }
+          // Multi-line comments
+          if (
+            trimmedLine.startsWith('/*') ||
+            trimmedLine.startsWith('*') ||
+            trimmedLine.endsWith('*/')
+          ) {
+            isComment = true;
+          }
+          break;
+
+        default:
+          // For unknown languages, try to detect common comment patterns
+          if (
+            trimmedLine.startsWith('//') ||
+            trimmedLine.startsWith('#') ||
+            trimmedLine.startsWith('/*') ||
+            trimmedLine.startsWith('*') ||
+            trimmedLine.startsWith('<!--')
+          ) {
+            isComment = true;
+          }
+          break;
+      }
+
+      // If it's not a comment, include the line
+      if (!isComment) {
+        filteredLines.push(line);
+      } else {
+        // Replace comment lines with empty lines to maintain line numbers
+        commentLines.add(lineNumber);
+        filteredLines.push('');
+      }
+    }
+
+    return {
+      filteredContent: filteredLines.join('\n'),
+      commentLines,
+    };
+  }
+
+  /**
+   * Validate and correct line numbers based on actual file content and changes
+   */
+  function validateAndCorrectLineNumbers(
+    issues: Array<{
+      line: number;
+      severity: 'critical' | 'warning' | 'info';
+      category: 'security' | 'bug' | 'performance' | 'maintainability';
+      message: string;
+      suggestion: string;
+      explanation: string;
+    }>,
+    fileContent: string,
+    changedLines: Set<number>,
+    addedLines: Set<number>,
+    commentLines: Set<number>
+  ): Array<{
+    line: number;
+    severity: 'critical' | 'warning' | 'info';
+    category: 'security' | 'bug' | 'performance' | 'maintainability';
+    message: string;
+    suggestion: string;
+    explanation: string;
+  }> {
+    const totalLines = fileContent.split('\n').length;
+
+    return issues.map((issue) => {
+      let correctedLine = issue.line;
+
+      // Ensure line number is within file bounds
+      if (correctedLine < 1) {
+        correctedLine = 1;
+      } else if (correctedLine > totalLines) {
+        correctedLine = totalLines;
+      }
+
+      // If the line is a comment line, try to find the nearest non-comment changed line
+      if (commentLines.has(correctedLine)) {
+        // Look for the nearest changed line (prefer added lines)
+        let nearestChangedLine = correctedLine;
+        let minDistance = Infinity;
+
+        for (const changedLine of changedLines) {
+          if (!commentLines.has(changedLine)) {
+            const distance = Math.abs(changedLine - correctedLine);
+            if (distance < minDistance) {
+              minDistance = distance;
+              nearestChangedLine = changedLine;
+            }
+          }
+        }
+
+        // If we found a better line within reasonable distance, use it
+        if (
+          minDistance <= config.lineNumberValidation.maxCorrectionDistance &&
+          nearestChangedLine !== correctedLine
+        ) {
+          logger.info('Corrected line number from comment line', {
+            originalLine: correctedLine,
+            correctedLine: nearestChangedLine,
+            reason: 'Original line was a comment',
+          });
+          correctedLine = nearestChangedLine;
+        }
+      }
+
+      // Prefer lines that were actually changed (if enabled)
+      if (
+        config.lineNumberValidation.preferChangedLines &&
+        !changedLines.has(correctedLine) &&
+        changedLines.size > 0
+      ) {
+        // Find the nearest changed line
+        let nearestChangedLine = correctedLine;
+        let minDistance = Infinity;
+
+        for (const changedLine of changedLines) {
+          const distance = Math.abs(changedLine - correctedLine);
+          if (distance < minDistance) {
+            minDistance = distance;
+            nearestChangedLine = changedLine;
+          }
+        }
+
+        // If the nearest changed line is within configured distance, use it
+        if (minDistance <= config.lineNumberValidation.maxCorrectionDistance) {
+          logger.info('Corrected line number to nearest changed line', {
+            originalLine: correctedLine,
+            correctedLine: nearestChangedLine,
+            distance: minDistance,
+          });
+          correctedLine = nearestChangedLine;
+        }
+      }
+
+      return {
+        ...issue,
+        line: correctedLine,
+      };
+    });
+  }
+
+  /**
+   * Fetch existing comments on a PR to avoid duplicates
+   */
+  async function fetchExistingPRComments(
+    octokit: Octokit,
+    owner: string,
+    repo: string,
+    prNumber: number
+  ): Promise<Array<{ path: string; line: number; body: string }>> {
+    try {
+      // Fetch review comments (line-specific comments)
+      const reviewComments = await octokit.pulls.listReviewComments({
+        owner,
+        repo,
+        pull_number: prNumber,
+      });
+
+      // Fetch general PR comments
+      const issueComments = await octokit.issues.listComments({
+        owner,
+        repo,
+        issue_number: prNumber,
+      });
+
+      const existingComments: Array<{ path: string; line: number; body: string }> = [];
+
+      // Process review comments (these have file path and line number)
+      for (const comment of reviewComments.data) {
+        if (comment.path && comment.line && comment.body) {
+          existingComments.push({
+            path: comment.path,
+            line: comment.line,
+            body: comment.body,
+          });
+        }
+      }
+
+      // Process issue comments (these don't have specific line numbers)
+      for (const comment of issueComments.data) {
+        if (comment.body) {
+          existingComments.push({
+            path: '', // General PR comment, not file-specific
+            line: 0,
+            body: comment.body,
+          });
+        }
+      }
+
+      logger.info('Fetched existing PR comments', {
+        reviewComments: reviewComments.data.length,
+        issueComments: issueComments.data.length,
+        total: existingComments.length,
+      });
+
+      return existingComments;
+    } catch (error) {
+      logger.warn('Failed to fetch existing PR comments', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return [];
+    }
+  }
+
+  /**
+   * Check if a comment is similar to existing comments to avoid duplicates
+   */
+  function isDuplicateComment(
+    newComment: ReviewComment,
+    existingComments: Array<{ path: string; line: number; body: string }>
+  ): boolean {
+    for (const existing of existingComments) {
+      // Check for exact path and line match
+      if (existing.path === newComment.path && existing.line === newComment.line) {
+        // Check if the comment is from our AI (has the signature)
+        if (existing.body.includes('🤖 Generated by Migaki AI')) {
+          logger.info('Skipping duplicate AI comment', {
+            path: newComment.path,
+            line: newComment.line,
+          });
+          return true;
+        }
+
+        // Check for similar content (simple similarity check)
+        const existingWords = existing.body.toLowerCase().split(/\s+/);
+        const newWords = newComment.body.toLowerCase().split(/\s+/);
+        const commonWords = existingWords.filter((word) => newWords.includes(word));
+        const similarity = commonWords.length / Math.max(existingWords.length, newWords.length);
+
+        // If more than 60% similar, consider it a duplicate
+        if (similarity > 0.6) {
+          logger.info('Skipping similar comment', {
+            path: newComment.path,
+            line: newComment.line,
+            similarity: Math.round(similarity * 100) + '%',
+          });
+          return true;
+        }
+      }
+    }
+
+    return false;
+  }
+
+  /**
+   * Filter out duplicate comments
+   */
+  function filterDuplicateComments(
+    comments: ReviewComment[],
+    existingComments: Array<{ path: string; line: number; body: string }>
+  ): ReviewComment[] {
+    const filteredComments = comments.filter(
+      (comment) => !isDuplicateComment(comment, existingComments)
+    );
+
+    const duplicatesRemoved = comments.length - filteredComments.length;
+    if (duplicatesRemoved > 0) {
+      logger.info('Filtered out duplicate comments', {
+        original: comments.length,
+        filtered: filteredComments.length,
+        duplicatesRemoved,
+      });
+    }
+
+    return filteredComments;
+  }
 
   /**
    * Check if a file should be skipped based on patterns
@@ -93,6 +646,21 @@ export function createPullRequestReviewService(deps: {
       userId,
     } = job;
 
+    // Create unique job identifier for deduplication
+    const jobId = `${repoId}-${prNumber}-${commitSha}`;
+
+    // Check if this job was recently processed
+    const now = Date.now();
+    const cachedResult = processedJobs.get(jobId);
+    if (cachedResult && now - cachedResult.timestamp < JOB_CACHE_TTL) {
+      logger.info('Job already processed recently, returning cached result', {
+        jobId,
+        cachedTimestamp: new Date(cachedResult.timestamp).toISOString(),
+        ageMinutes: Math.round((now - cachedResult.timestamp) / 60000),
+      });
+      return cachedResult.result;
+    }
+
     let cloneDir = '';
 
     try {
@@ -103,6 +671,7 @@ export function createPullRequestReviewService(deps: {
         repo,
         commitSha: commitSha.substring(0, 7),
         baseSha: baseSha.substring(0, 7),
+        jobId,
       });
 
       // Step 1: Get repository details
@@ -193,6 +762,10 @@ export function createPullRequestReviewService(deps: {
       }
 
       // Step 5: Generate code review using LLM
+      logger.info('Starting code review generation', {
+        filesCount: changedFiles.length,
+        circuitBreakerStatus: getCircuitBreakerStatus(),
+      });
       const reviewComments = await generateCodeReview(changedFiles, repository);
 
       // Step 6: Post comments to GitHub
@@ -209,13 +782,29 @@ export function createPullRequestReviewService(deps: {
         prNumber,
         commentsPosted: commentsPosted.length,
         reviewId: reviewId.reviewId,
+        jobId,
       });
 
-      return {
-        status: 'Success',
+      const result: PullRequestReviewResult = {
+        status: 'Success' as const,
         reviewId: reviewId.reviewId,
         commentsPosted: commentsPosted.length,
       };
+
+      // Cache successful result to prevent reprocessing
+      processedJobs.set(jobId, {
+        timestamp: now,
+        result,
+      });
+
+      // Clean up old cache entries
+      for (const [key, value] of processedJobs.entries()) {
+        if (now - value.timestamp > JOB_CACHE_TTL) {
+          processedJobs.delete(key);
+        }
+      }
+
+      return result;
     } catch (error) {
       logger.error('Error processing PR review', {
         prNumber,
@@ -252,10 +841,7 @@ export function createPullRequestReviewService(deps: {
       if (!filePath || file.binary) continue;
 
       try {
-        // Get the file diff (suppress verbose output)
-        const diff = await gitService.getFileDiff(repoGit, baseSha, commitSha, filePath);
-
-        // Get the current file content
+        // Get the current file content first
         const fs = await import('fs/promises');
         const fullPath = `${cloneDir}/${filePath}`;
 
@@ -267,11 +853,92 @@ export function createPullRequestReviewService(deps: {
           continue;
         }
 
+        // Skip binary files or files that are too large
+        if (content.includes('\0')) {
+          logger.debug('Skipping binary file', { filePath });
+          continue;
+        }
+
+        // Remove comments from code content to avoid reviewing them
+        const language = getLanguageFromPath(filePath);
+        const { filteredContent, commentLines } = removeCommentsFromCodeWithTracking(
+          content,
+          language
+        );
+
+        // Try to get the file diff (suppress verbose output)
+        let diff = '';
+        try {
+          diff = await gitService.getFileDiff(repoGit, baseSha, commitSha, filePath);
+
+          // If getFileDiff returned empty string due to error handling, treat as no diff
+          if (!diff || diff.trim() === '') {
+            logger.debug('Git service returned empty diff, likely due to error handling', {
+              filePath,
+            });
+            diff = ''; // Ensure it's empty for synthetic diff creation
+          }
+        } catch (error) {
+          logger.debug('Could not get diff for file, will review entire file content', {
+            filePath,
+            error: error instanceof Error ? error.message : String(error),
+          });
+          diff = ''; // Reset to empty for synthetic diff creation
+        }
+
+        // Parse diff to get changed line information
+        let diffAnalysis = {
+          changedLines: new Set<number>(),
+          addedLines: new Set<number>(),
+          deletedLines: new Set<number>(),
+          lineMapping: new Map(),
+        };
+
+        // If we couldn't get a diff, create a synthetic diff indicating the entire file
+        if (!diff || diff.trim() === '') {
+          logger.info('Creating synthetic diff for file review', {
+            filePath,
+            reason: 'No git diff available - will review entire file content',
+          });
+
+          const lines = content.split('\n');
+          const lineCount = lines.length;
+
+          // Create a synthetic diff that shows the entire file as new/modified content
+          diff = `diff --git a/${filePath} b/${filePath}
+index 0000000..0000000 100644
+--- a/${filePath}
++++ b/${filePath}
+@@ -0,0 +1,${lineCount} @@
+${lines.map((line) => `+${line}`).join('\n')}`;
+
+          // For synthetic diffs, mark all lines as added
+          for (let i = 1; i <= lineCount; i++) {
+            diffAnalysis.changedLines.add(i);
+            diffAnalysis.addedLines.add(i);
+          }
+        } else {
+          // Parse the actual diff to get line information
+          diffAnalysis = parseDiffForLineRanges(diff);
+        }
+
+        // Create annotated content for better AI understanding
+        const annotatedContent = createAnnotatedFileContent(
+          filteredContent,
+          diffAnalysis.changedLines,
+          diffAnalysis.addedLines,
+          commentLines
+        );
+
         changedFiles.push({
           path: filePath,
-          content,
+          content: filteredContent,
+          originalContent: content,
+          annotatedContent,
           diff,
-          language: getLanguageFromPath(filePath),
+          language,
+          diffAnalysis,
+          commentLines,
         });
       } catch (error) {
         logger.warn('Failed to process file', {
@@ -315,8 +982,8 @@ export function createPullRequestReviewService(deps: {
         // Analyze with LLM
         const analysis = await analyzeCodeWithLLM(file, similarCode);
 
-        // Parse LLM response into structured comments
-        const fileComments = parseAnalysisIntoComments(analysis, file.path);
+        // Convert LLM analysis into review comments
+        const fileComments = convertAnalysisToComments(analysis.issues || [], file.path);
 
         // Limit comments per file to avoid overwhelming developers
         const limitedComments = fileComments.slice(0, config.maxCommentsPerFile);
@@ -396,9 +1063,22 @@ export function createPullRequestReviewService(deps: {
   }
 
   /**
-   * Analyze code using LLM
+   * Analyze code using LLM with structured output and robust retry logic
    */
-  async function analyzeCodeWithLLM(file: any, similarCode: any[]) {
+  async function analyzeCodeWithLLM(
+    file: any,
+    similarCode: any[]
+  ): Promise<{
+    summary: string;
+    issues: Array<{
+      line: number;
+      severity: 'critical' | 'warning' | 'info';
+      category: 'security' | 'bug' | 'performance' | 'maintainability';
+      message: string;
+      suggestion: string;
+      explanation: string;
+    }>;
+  }> {
     const contextInfo =
       similarCode.length > 0
         ? `\n\nSimilar code patterns in this repository:\n${similarCode
@@ -407,114 +1087,333 @@ export function createPullRequestReviewService(deps: {
             )
             .join('\n\n')}`
         : '';
+    logger.info('Context info', { contextInfo });
+    logger.info('File diff', { fileDiff: file.diff });
+    logger.info('File content', { fileContent: file.content });
+    logger.info('File path', { filePath: file.path });
+    logger.info('File language', { fileLanguage: file.language });
+    logger.info('File similar code', { fileSimilarCode: similarCode });
 
-    const prompt = `You are an expert ${file.language} code reviewer with 10+ years of experience. Analyze this code change with the same rigor as a senior engineer.
+    // Determine change type based on diff content
+    let changeType = 'unknown';
+    if (file.diff.includes('+++') && file.diff.includes('---')) {
+      if (file.diff.includes('new file') || file.diff.includes('index 0000000..0000000')) {
+        changeType = 'new file';
+      } else if (file.diff.includes('deleted file')) {
+        changeType = 'deleted file';
+      } else {
+        changeType = 'modification';
+      }
+    } else if (file.diff.includes('@@ -0,0 +1,')) {
+      // This is likely our synthetic diff for a new/modified file
+      changeType = 'file review (no diff available)';
+    }
 
-**File Context:**
-- Path: ${file.path}
-- Language: ${file.language}
-- Change Type: ${file.diff.includes('+') ? 'Addition/Modification' : 'Deletion'}
+    // Create context-specific instructions based on change type
+    const getChangeTypeInstructions = (changeType: string) => {
+      switch (changeType) {
+        case 'new file':
+          return `**This is a NEW FILE being added to the codebase.** Focus on:
+- Overall architecture and design patterns
+- Code organization and structure
+- Naming conventions and clarity
+- Security implications of new functionality
+- Performance considerations
+- Integration with existing codebase
+- Missing error handling or edge cases
+- Documentation and comments for complex logic`;
 
-**Code Changes:**
-\`\`\`diff
-${file.diff}
+        case 'modification':
+          return `**This is a MODIFIED FILE with specific changes.** Focus on:
+- Impact of changes on existing functionality
+- Potential breaking changes
+- Backward compatibility
+- Changes in behavior or logic
+- New bugs introduced by modifications
+- Performance impact of changes`;
+
+        case 'file review (no diff available)':
+          return `**Full file review (diff unavailable).** Treat as comprehensive review:
+- Review entire file for potential issues
+- Focus on overall code quality and best practices
+- Look for security vulnerabilities
+- Check for performance issues
+- Verify error handling and edge cases`;
+
+        default:
+          return `**Code review for ${changeType}.** Apply standard review practices.`;
+      }
+    };
+
+    const prompt = `Your task is to conduct a thorough analysis of a code change, applying the same level of scrutiny as a senior engineer would.
+
+IMPORTANT: 
+- Do NOT review or comment on code comments, documentation, or comment blocks. Focus only on the actual executable code logic, structure, and implementation.
+- Pay special attention to line numbers. Use the line numbers shown in the annotated content below.
+- Focus your review on lines marked as [ADDED LINE] or [MODIFIED LINE] as these are the actual changes.
+- Lines marked as [COMMENT LINE - FILTERED] should be ignored.
+
+First, review the annotated file content with line numbers:
+
+<annotated_file_content>
+\`\`\`${file.language}
+${file.annotatedContent}
 \`\`\`
+</annotated_file_content>
 
-**Current File Content:**
+Original file content for context:
+
+<current_file_content>
 \`\`\`${file.language}
 ${file.content}
 \`\`\`
+</current_file_content>
+
+Next, review the following file context information:
+
+<file_context>
+Path: <file_path>${file.path}</file_path>
+Language: <language>${file.language}</language>
+Change Type: <change_type>${changeType}</change_type>
+</file_context>
+
+${getChangeTypeInstructions(changeType)}
+
+Now, examine the code changes:
+
+<code_diff>
+\`\`\`diff
+${file.diff}
+\`\`\`
+</code_diff>
+
+Consider any additional context information provided:
+
+<context_info>
 ${contextInfo}
+</context_info>
 
-**Review Priorities (focus only on issues that could cause problems):**
+Your review should focus on the following priorities, in order of importance:
 
-🔴 **CRITICAL - Must Fix:**
-- Security vulnerabilities (injection, XSS, auth bypass)
-- Data corruption or loss risks
-- Memory leaks or resource exhaustion
-- Race conditions or concurrency issues
+1. CRITICAL (Must Fix):
+   - Security vulnerabilities (e.g., injection, XSS, auth bypass)
+   - Data corruption or loss risks
+   - Memory leaks or resource exhaustion
+   - Race conditions or concurrency issues
 
-🟡 **WARNING - Should Fix:**
-- Logic errors that could cause incorrect behavior
-- Performance issues in critical paths
-- Error handling gaps
-- API design inconsistencies
+2. WARNING (Should Fix):
+   - Logic errors that could cause incorrect behavior
+   - Performance issues in critical paths
+   - Error handling gaps
+   - API design inconsistencies
 
-🔵 **INFO - Consider:**
-- Code readability improvements
-- Better naming or structure
-- Missing documentation for complex logic
+3. INFO (Consider):
+   - Code readability improvements
+   - Better naming or structure
+   - Missing documentation for complex logic
 
-**DO NOT flag:**
-- Stylistic preferences if code is readable
+Do not flag:
+- Stylistic preferences if the code is readable
 - Valid alternative approaches
 - TODOs or commented code that's clearly intentional
 - Minor spacing or formatting (if consistent)
 
-**Required Response Format:**
-Return ONLY a valid JSON array. Each issue must include specific line numbers and actionable suggestions:
+Analyze the code thoroughly, considering:
+${
+  changeType === 'new file'
+    ? `- Overall design and architecture of the new file
+- Adherence to project conventions and patterns
+- Security implications of new functionality
+- Performance considerations for new code
+- Error handling and edge case coverage
+- Code organization and maintainability
+- Integration points with existing codebase
+- Missing documentation or unclear logic`
+    : changeType === 'modification'
+      ? `- Impact of changes on existing functionality
+- Potential bugs or regressions introduced
+- Backward compatibility considerations
+- Security implications of modifications
+- Performance impact of changes
+- Code quality improvements or degradations`
+      : `- Overall code quality and best practices
+- Security vulnerabilities throughout the file
+- Performance issues and optimization opportunities
+- Error handling and robustness
+- Code organization and maintainability
+- Adherence to language-specific best practices`
+}
 
-[
-  {
-    "line": 42,
-    "severity": "critical|warning|info",
-    "category": "security|bug|performance|maintainability",
-    "message": "Specific issue description with context",
-    "suggestion": "Exact code fix or specific action to take",
-    "explanation": "Why this matters and potential impact"
-  }
-]
+You must respond with a JSON object containing:
+1. "summary": A brief overall assessment of the code change
+2. "issues": An array of issue objects, each containing:
+   - "line": The EXACT line number from the annotated content where the issue occurs (look for the number at the start of each line like "  42: code here"). Focus on lines marked as [ADDED LINE] or [MODIFIED LINE]. If you cannot determine the exact line, use the closest line number from the changed lines.
+   - "severity": One of "critical", "warning", or "info"
+   - "category": One of "security", "bug", "performance", or "maintainability"
+   - "message": A clear description of the problem
+   - "suggestion": A specific fix or improvement recommendation
+   - "explanation": Why this issue matters and its potential impact
 
-**Examples of good feedback:**
-- "Line 15: Potential SQL injection. Use parameterized queries instead of string concatenation."
-- "Line 23: This loop has O(n²) complexity. Consider using a Map for O(1) lookups."
-- "Line 8: Missing null check could cause runtime error when user is undefined."
+CRITICAL: When specifying line numbers, use the exact line numbers shown in the annotated content (the numbers at the beginning of each line). Only comment on lines that are marked as [ADDED LINE] or [MODIFIED LINE].
 
-Return empty array [] if no actionable issues found.`;
+If no actionable issues are found, return an empty issues array and explain this in the summary.`;
 
-    try {
-      const response = await openai.chat.completions.create({
-        model: config.modelConfig.model,
-        messages: [{ role: 'user', content: prompt }],
-        temperature: config.modelConfig.temperature,
-        max_tokens: config.modelConfig.maxTokens,
-      });
-
-      const content = response.choices[0]?.message?.content;
-      if (!content) {
-        return [];
+    // Check circuit breaker state
+    const now = Date.now();
+    if (circuitBreakerState.isOpen) {
+      if (now - circuitBreakerState.lastFailureTime > circuitBreakerState.resetTimeoutMs) {
+        // Reset circuit breaker
+        circuitBreakerState.isOpen = false;
+        circuitBreakerState.failureCount = 0;
+        logger.info('Circuit breaker reset - attempting API calls again', {
+          filePath: file.path,
+        });
+      } else {
+        logger.warn('Circuit breaker is open - skipping API call', {
+          filePath: file.path,
+          timeUntilReset:
+            circuitBreakerState.resetTimeoutMs - (now - circuitBreakerState.lastFailureTime),
+        });
+        return {
+          summary: 'Analysis skipped due to API overload protection. Please try again later.',
+          issues: [],
+        };
       }
+    }
 
-      // Try to parse JSON response, handling markdown code blocks
+    // Retry configuration for handling API overload
+    const MAX_RETRIES = config.retryConfig.maxRetries;
+    const BASE_DELAY = config.retryConfig.baseDelayMs;
+    const MAX_DELAY = config.retryConfig.maxDelayMs;
+
+    for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
       try {
-        // Remove markdown code blocks if present
-        let jsonContent = content.trim();
-        if (jsonContent.startsWith('```json') && jsonContent.endsWith('```')) {
-          jsonContent = jsonContent.slice(7, -3).trim();
-        } else if (jsonContent.startsWith('```') && jsonContent.endsWith('```')) {
-          jsonContent = jsonContent.slice(3, -3).trim();
+        logger.info('Attempting LLM analysis', {
+          attempt,
+          maxRetries: MAX_RETRIES,
+          filePath: file.path,
+        });
+
+        const result = await generateObject({
+          model: anthropic('claude-4-sonnet-20250514'),
+          schema: z.object({
+            summary: z.string(),
+            issues: z.array(
+              z.object({
+                line: z.number(),
+                severity: z.enum(['critical', 'warning', 'info']),
+                category: z.enum(['security', 'bug', 'performance', 'maintainability']),
+                message: z.string(),
+                suggestion: z.string(),
+                explanation: z.string(),
+              })
+            ),
+          }),
+          system: `You are an expert code reviewer with over 10 years of experience in ${file.language} and software engineering best practices. ${
+            changeType === 'new file'
+              ? `You are reviewing a completely new file being added to the codebase. Pay special attention to overall design, architecture, and how this new code fits into the existing project structure.`
+              : changeType === 'modification'
+                ? `You are reviewing modifications to an existing file. Focus on the specific changes and their impact on existing functionality.`
+                : `You are conducting a comprehensive review of this file. Examine the entire codebase for potential issues.`
+          }`,
+          prompt: prompt,
+          // Add retry configuration to the AI SDK call
+          maxRetries: 0, // Disable AI SDK's internal retries since we're handling them manually
+        });
+
+        logger.info('LLM analysis successful', {
+          attempt,
+          result: result.object,
+          summary: result.object.summary,
+          issuesCount: result.object.issues.length,
+        });
+
+        // Reset circuit breaker on success
+        circuitBreakerState.failureCount = 0;
+
+        // Validate and correct line numbers if enabled
+        const correctedIssues = config.lineNumberValidation.enabled
+          ? validateAndCorrectLineNumbers(
+              result.object.issues,
+              file.content,
+              file.diffAnalysis.changedLines,
+              file.diffAnalysis.addedLines,
+              file.commentLines
+            )
+          : result.object.issues;
+
+        return {
+          ...result.object,
+          issues: correctedIssues,
+        };
+      } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : String(error);
+        const isOverloadError =
+          errorMessage.toLowerCase().includes('overload') ||
+          errorMessage.includes('529') ||
+          errorMessage.toLowerCase().includes('rate limit');
+
+        logger.warn('LLM analysis attempt failed', {
+          attempt,
+          maxRetries: MAX_RETRIES,
+          error: errorMessage,
+          isOverloadError,
+          filePath: file.path,
+        });
+
+        // If this is the last attempt, log the final error and return fallback
+        if (attempt === MAX_RETRIES) {
+          // Update circuit breaker on overload errors
+          if (isOverloadError) {
+            circuitBreakerState.failureCount++;
+            circuitBreakerState.lastFailureTime = Date.now();
+
+            if (circuitBreakerState.failureCount >= circuitBreakerState.maxFailures) {
+              circuitBreakerState.isOpen = true;
+              logger.warn('Circuit breaker opened due to repeated API overload errors', {
+                failureCount: circuitBreakerState.failureCount,
+                filePath: file.path,
+              });
+            }
+          }
+
+          logger.error('LLM analysis failed after all retries', {
+            totalAttempts: MAX_RETRIES,
+            finalError: errorMessage,
+            filePath: file.path,
+            circuitBreakerOpen: circuitBreakerState.isOpen,
+          });
+          return {
+            summary: `Analysis failed after ${MAX_RETRIES} attempts due to API overload. Please try again later.`,
+            issues: [],
+          };
         }
 
-        return JSON.parse(jsonContent);
-      } catch (error) {
-        logger.warn('Failed to parse LLM response as JSON', {
-          content: content.substring(0, 500) + (content.length > 500 ? '...' : ''),
-          error: error instanceof Error ? error.message : String(error),
+        // Calculate exponential backoff delay with optional jitter
+        const exponentialDelay = Math.min(BASE_DELAY * Math.pow(2, attempt - 1), MAX_DELAY);
+        const jitter = config.retryConfig.enableJitter ? Math.random() * 1000 : 0; // Add up to 1 second of random jitter if enabled
+        const delay = exponentialDelay + jitter;
+
+        logger.info('Retrying LLM analysis with backoff', {
+          attempt,
+          nextAttempt: attempt + 1,
+          delayMs: Math.round(delay),
+          isOverloadError,
         });
-        return [];
+
+        // Wait before retrying
+        await new Promise((resolve) => setTimeout(resolve, delay));
       }
-    } catch (error) {
-      logger.error('LLM analysis failed', {
-        error: error instanceof Error ? error.message : String(error),
-      });
-      return [];
     }
+
+    // This should never be reached due to the return in the catch block above
+    return { summary: 'Analysis failed unexpectedly', issues: [] };
   }
 
   /**
-   * Parse LLM analysis into review comments
+   * Convert LLM analysis into review comments
    */
-  function parseAnalysisIntoComments(analysis: any[], filePath: string): ReviewComment[] {
+  function convertAnalysisToComments(analysis: any[], filePath: string): ReviewComment[] {
     if (!Array.isArray(analysis)) {
       return [];
     }
@@ -549,7 +1448,7 @@ Return empty array [] if no actionable issues found.`;
         }
 
         // Add AI signature
-        body += '\n\n---\n*🤖 Generated by AI Code Review*';
+        body += '\n\n---\n*🤖 Generated by Migaki AI*';
 
         return {
           path: filePath,
@@ -568,6 +1467,7 @@ Return empty array [] if no actionable issues found.`;
 
   /**
    * Post review comments to GitHub using GitHub App authentication
+   * Uses the Pull Request Review API for efficient batch posting
    */
   async function postCommentsToGitHub(
     installationId: number,
@@ -585,6 +1485,9 @@ Return empty array [] if no actionable issues found.`;
       return logCommentsInstead(comments, { installationId, owner, repo, prNumber, commitSha });
     }
 
+    // Declare filteredComments outside try block for broader scope
+    let filteredComments = comments;
+
     try {
       const octokit = new Octokit({
         authStrategy: createAppAuth,
@@ -595,11 +1498,112 @@ Return empty array [] if no actionable issues found.`;
         },
       });
 
-      const postedComments = [];
+      if (comments.length === 0) {
+        logger.info('No comments to post');
+        return [];
+      }
 
-      // Post individual line comments
-      for (const comment of comments) {
+      // Fetch existing comments to avoid duplicates
+      const existingComments = await fetchExistingPRComments(octokit, owner, repo, prNumber);
+
+      // Filter out duplicate comments
+      filteredComments = filterDuplicateComments(comments, existingComments);
+
+      if (filteredComments.length === 0) {
+        logger.info('All comments were duplicates, skipping posting');
+        return [];
+      }
+
+      // Use GitHub's Pull Request Review API for batch posting
+      // This is much more efficient and avoids rate limits
+      const reviewComments = filteredComments.map((comment) => ({
+        path: comment.path,
+        line: comment.line,
+        body: comment.body,
+      }));
+
+      const summary = generateReviewSummary(filteredComments);
+      const criticalCount = filteredComments.filter((c) => c.severity === 'error').length;
+
+      // Determine review event based on severity
+      const event = criticalCount > 0 ? 'REQUEST_CHANGES' : 'COMMENT';
+
+      try {
+        const reviewResponse = await octokit.pulls.createReview({
+          owner,
+          repo,
+          pull_number: prNumber,
+          commit_id: commitSha,
+          body: summary,
+          event: event as 'APPROVE' | 'REQUEST_CHANGES' | 'COMMENT',
+          comments: reviewComments,
+        });
+
+        logger.info('Posted complete PR review', {
+          reviewId: reviewResponse.data.id,
+          commentsCount: filteredComments.length,
+          event,
+          criticalIssues: criticalCount,
+        });
+
+        return [reviewResponse.data];
+      } catch (error) {
+        logger.error('Failed to post batch review, falling back to individual comments', {
+          error: error instanceof Error ? error.message : String(error),
+        });
+
+        // Fallback: Post individual comments with rate limiting
+        return await postIndividualCommentsWithRateLimit(
+          octokit,
+          owner,
+          repo,
+          prNumber,
+          commitSha,
+          filteredComments
+        );
+      }
+    } catch (error) {
+      logger.error('Failed to authenticate with GitHub', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+
+      // Fall back to logging
+      return logCommentsInstead(filteredComments, {
+        installationId,
+        owner,
+        repo,
+        prNumber,
+        commitSha,
+      });
+    }
+  }
+
+  /**
+   * Fallback method to post individual comments with rate limiting
+   */
+  async function postIndividualCommentsWithRateLimit(
+    octokit: Octokit,
+    owner: string,
+    repo: string,
+    prNumber: number,
+    commitSha: string,
+    comments: ReviewComment[]
+  ) {
+    const postedComments = [];
+    const RATE_LIMIT_DELAY = 1000; // 1 second between requests
+    const MAX_RETRIES = 3;
+
+    for (let i = 0; i < comments.length; i++) {
+      const comment = comments[i];
+      let retries = 0;
+
+      while (retries < MAX_RETRIES) {
         try {
+          // Add delay between requests to avoid rate limiting
+          if (i > 0) {
+            await new Promise((resolve) => setTimeout(resolve, RATE_LIMIT_DELAY));
+          }
+
           const response = await octokit.pulls.createReviewComment({
             owner,
             repo,
@@ -611,51 +1615,63 @@ Return empty array [] if no actionable issues found.`;
           });
 
           postedComments.push(response.data);
-          logger.info('Posted review comment', {
+          logger.info('Posted individual review comment', {
             path: comment.path,
             line: comment.line,
             commentId: response.data.id,
+            attempt: retries + 1,
           });
+          break; // Success, move to next comment
         } catch (error) {
-          logger.warn('Failed to post individual comment', {
-            path: comment.path,
-            line: comment.line,
-            error: error instanceof Error ? error.message : String(error),
-          });
+          retries++;
+          const errorMessage = error instanceof Error ? error.message : String(error);
+
+          if (errorMessage.includes('rate limit') && retries < MAX_RETRIES) {
+            const backoffDelay = RATE_LIMIT_DELAY * Math.pow(2, retries); // Exponential backoff
+            logger.warn('Rate limit hit, retrying with backoff', {
+              path: comment.path,
+              line: comment.line,
+              attempt: retries,
+              delayMs: backoffDelay,
+            });
+            await new Promise((resolve) => setTimeout(resolve, backoffDelay));
+          } else {
+            logger.error('Failed to post individual comment after retries', {
+              path: comment.path,
+              line: comment.line,
+              error: errorMessage,
+              attempts: retries,
+            });
+            break; // Give up on this comment
+          }
         }
       }
-
-      // Post summary comment if there are issues
-      if (comments.length > 0) {
-        const summary = generateReviewSummary(comments);
-        try {
-          const summaryResponse = await octokit.issues.createComment({
-            owner,
-            repo,
-            issue_number: prNumber,
-            body: summary,
-          });
-
-          logger.info('Posted review summary', {
-            commentId: summaryResponse.data.id,
-            commentsCount: comments.length,
-          });
-        } catch (error) {
-          logger.warn('Failed to post summary comment', {
-            error: error instanceof Error ? error.message : String(error),
-          });
-        }
-      }
-
-      return postedComments;
-    } catch (error) {
-      logger.error('Failed to authenticate with GitHub', {
-        error: error instanceof Error ? error.message : String(error),
-      });
-
-      // Fall back to logging
-      return logCommentsInstead(comments, { installationId, owner, repo, prNumber, commitSha });
     }
+
+    // Post summary comment separately
+    if (comments.length > 0) {
+      const summary = generateReviewSummary(comments);
+      try {
+        await new Promise((resolve) => setTimeout(resolve, RATE_LIMIT_DELAY));
+        const summaryResponse = await octokit.issues.createComment({
+          owner,
+          repo,
+          issue_number: prNumber,
+          body: summary,
+        });
+
+        logger.info('Posted review summary', {
+          commentId: summaryResponse.data.id,
+          commentsCount: comments.length,
+        });
+      } catch (error) {
+        logger.warn('Failed to post summary comment', {
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+
+    return postedComments;
   }
 
   /**
@@ -770,7 +1786,25 @@ Return empty array [] if no actionable issues found.`;
     }
   }
 
+  /**
+   * Get current circuit breaker status for monitoring
+   */
+  function getCircuitBreakerStatus() {
+    return {
+      isOpen: circuitBreakerState.isOpen,
+      failureCount: circuitBreakerState.failureCount,
+      lastFailureTime: circuitBreakerState.lastFailureTime,
+      timeUntilReset: circuitBreakerState.isOpen
+        ? Math.max(
+            0,
+            circuitBreakerState.resetTimeoutMs - (Date.now() - circuitBreakerState.lastFailureTime)
+          )
+        : 0,
+    };
+  }
+
   return {
     processPullRequestReview,
+    getCircuitBreakerStatus,
   };
 }

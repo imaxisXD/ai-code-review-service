@@ -37,15 +37,26 @@ export async function determineChanges(
         .filter((file): file is string => file !== undefined)
         .map((relPath: string) => path.join(cloneDir, relPath));
     } catch (error) {
-      logger.error('Error getting diff summary', {
+      logger.warn('Error getting diff summary, falling back to initial indexing', {
         error: error instanceof Error ? error.message : String(error),
         beforeSha,
         endSha,
       });
-      throw error;
+
+      // Fall back to initial indexing if diff fails
+      logger.info('Falling back to initial indexing - getting all files');
+      const allFiles = await getAllFilesRecursive(cloneDir);
+      filesToProcess = allFiles.filter((file: string) => shouldProcessFile(file));
+      filesToDelete = []; // No files to delete in fallback mode
     }
   } else {
-    logger.info('No changes detected or missing SHAs for incremental indexing');
+    logger.info(
+      'No changes detected or missing SHAs for incremental indexing, falling back to initial indexing'
+    );
+    // Fall back to initial indexing
+    const allFiles = await getAllFilesRecursive(cloneDir);
+    filesToProcess = allFiles.filter((file: string) => shouldProcessFile(file));
+    filesToDelete = [];
   }
 
   logger.info('Changes determined', {
