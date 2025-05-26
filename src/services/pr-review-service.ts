@@ -138,7 +138,7 @@ const DEFAULT_CONFIG: ReviewConfig = {
     similarCodeLimit: 5,
   },
   retryConfig: {
-    maxRetries: 0, // Disable retries to prevent loops - let Pub/Sub handle retries
+    maxRetries: 1, // Enable retries for LLM analysis - Pub/Sub will handle job-level retries
     baseDelayMs: 2000,
     maxDelayMs: 30000,
     enableJitter: true,
@@ -765,8 +765,25 @@ export function createPullRequestReviewService(deps: {
       logger.info('Starting code review generation', {
         filesCount: changedFiles.length,
         circuitBreakerStatus: getCircuitBreakerStatus(),
+        fileDetails: changedFiles.map((f) => ({
+          path: f.path,
+          language: f.language,
+          contentLength: f.content?.length || 0,
+          hasChanges: f.diffAnalysis?.changedLines?.size || 0,
+        })),
       });
       const reviewComments = await generateCodeReview(changedFiles, repository);
+
+      logger.info('Code review generation completed', {
+        totalComments: reviewComments.length,
+        commentsByFile: reviewComments.reduce(
+          (acc, comment) => {
+            acc[comment.path] = (acc[comment.path] || 0) + 1;
+            return acc;
+          },
+          {} as Record<string, number>
+        ),
+      });
 
       // Step 6: Post comments to GitHub
       const commentsPosted = await postCommentsToGitHub(
@@ -1260,6 +1277,14 @@ If no actionable issues are found, return an empty issues array and explain this
 
     // Check circuit breaker state
     const now = Date.now();
+    logger.info('Circuit breaker status check', {
+      filePath: file.path,
+      isOpen: circuitBreakerState.isOpen,
+      failureCount: circuitBreakerState.failureCount,
+      lastFailureTime: circuitBreakerState.lastFailureTime,
+      timeSinceLastFailure: now - circuitBreakerState.lastFailureTime,
+    });
+
     if (circuitBreakerState.isOpen) {
       if (now - circuitBreakerState.lastFailureTime > circuitBreakerState.resetTimeoutMs) {
         // Reset circuit breaker
@@ -1282,7 +1307,7 @@ If no actionable issues are found, return an empty issues array and explain this
     }
 
     // Retry configuration for handling API overload
-    const MAX_RETRIES = config.retryConfig.maxRetries;
+    const MAX_RETRIES = Math.max(1, config.retryConfig.maxRetries); // Ensure at least 1 attempt
     const BASE_DELAY = config.retryConfig.baseDelayMs;
     const MAX_DELAY = config.retryConfig.maxDelayMs;
 
@@ -1323,9 +1348,15 @@ If no actionable issues are found, return an empty issues array and explain this
 
         logger.info('LLM analysis successful', {
           attempt,
-          result: result.object,
+          filePath: file.path,
           summary: result.object.summary,
           issuesCount: result.object.issues.length,
+          issues: result.object.issues.map((issue) => ({
+            line: issue.line,
+            severity: issue.severity,
+            category: issue.category,
+            message: issue.message.substring(0, 100) + (issue.message.length > 100 ? '...' : ''),
+          })),
         });
 
         // Reset circuit breaker on success
