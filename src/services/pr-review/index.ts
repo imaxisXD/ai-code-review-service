@@ -168,14 +168,13 @@ export function createPullRequestReviewService(deps: {
 
       // Step 5: Generate code review using LLM
       logger.info('Starting code review generation', {
-        filesCount: changedFiles.length,
-        circuitBreakerStatus: circuitBreaker.getStatus(),
-        fileDetails: changedFiles.map((f) => ({
-          path: f.path,
-          language: f.language,
-          contentLength: f.content?.length || 0,
-          hasChanges: f.diffAnalysis?.changedLines?.size || 0,
-        })),
+        totalFiles: changedFiles.length,
+        filteredFiles: changedFiles.filter(
+          (file) => !shouldSkipFile(file.path, config.skipPatterns)
+        ).length,
+        skippedFiles:
+          changedFiles.length -
+          changedFiles.filter((file) => !shouldSkipFile(file.path, config.skipPatterns)).length,
       });
 
       const { comments: reviewComments, fileValidDiffLines } = await generateCodeReview(
@@ -184,14 +183,11 @@ export function createPullRequestReviewService(deps: {
       );
 
       logger.info('Code review generation completed', {
+        totalFiles: changedFiles.length,
+        successfulAnalyses: reviewComments.length,
+        failedAnalyses: 0,
         totalComments: reviewComments.length,
-        commentsByFile: reviewComments.reduce(
-          (acc, comment) => {
-            acc[comment.path] = (acc[comment.path] || 0) + 1;
-            return acc;
-          },
-          {} as Record<string, number>
-        ),
+        circuitBreakerStatus: circuitBreaker.getStatus(),
       });
 
       // Step 6: Post comments to GitHub
@@ -294,17 +290,19 @@ export function createPullRequestReviewService(deps: {
     const reviewComments: ReviewComment[] = [];
     const fileValidDiffLines = new Map<string, Set<number>>();
 
-    // Filter files based on skip patterns and limits
-    const filteredFiles = changedFiles
-      .filter((file) => !shouldSkipFile(file.path, config.skipPatterns))
-      .filter((file) => file.content.split('\n').length <= config.maxLinesPerFile)
-      .slice(0, config.maxFilesPerReview);
+    // Filter files that should be skipped
+    const filteredFiles = changedFiles.filter(
+      (file) => !shouldSkipFile(file.path, config.skipPatterns)
+    );
 
-    logger.info('Files to review', {
-      total: changedFiles.length,
-      filtered: filteredFiles.length,
-      skipped: changedFiles.length - filteredFiles.length,
+    logger.info('Starting code review generation', {
+      totalFiles: changedFiles.length,
+      filteredFiles: filteredFiles.length,
+      skippedFiles: changedFiles.length - filteredFiles.length,
     });
+
+    let successfulAnalyses = 0;
+    let failedAnalyses = 0;
 
     for (const file of filteredFiles) {
       try {
@@ -328,6 +326,19 @@ export function createPullRequestReviewService(deps: {
 
         // Analyze with LLM
         const analysis = await analyzeCodeWithLLM(file, similarCode, config, circuitBreaker);
+
+        // Check if analysis failed due to rate limits
+        if (
+          analysis.summary.includes('Analysis failed') ||
+          analysis.summary.includes('API overload')
+        ) {
+          failedAnalyses++;
+          logger.warn('File analysis failed due to rate limits, skipping', {
+            path: file.path,
+            summary: analysis.summary,
+          });
+          continue; // Skip this file but continue with others
+        }
 
         // Validate and correct line numbers if enabled
         const correctedIssues = config.lineNumberValidation.enabled
@@ -361,12 +372,31 @@ export function createPullRequestReviewService(deps: {
         }
 
         reviewComments.push(...limitedComments);
+        successfulAnalyses++;
       } catch (error) {
+        failedAnalyses++;
         logger.error('Error analyzing file', {
           path: file.path,
           error: error instanceof Error ? error.message : String(error),
         });
+        // Continue with other files instead of failing the entire review
       }
+    }
+
+    logger.info('Code review generation completed', {
+      totalFiles: filteredFiles.length,
+      successfulAnalyses,
+      failedAnalyses,
+      totalComments: reviewComments.length,
+      circuitBreakerStatus: circuitBreaker.getStatus(),
+    });
+
+    // Add a summary comment if some files failed due to rate limits
+    if (failedAnalyses > 0) {
+      logger.info('Some files failed analysis due to rate limits', {
+        failedCount: failedAnalyses,
+        successfulCount: successfulAnalyses,
+      });
     }
 
     return { comments: reviewComments, fileValidDiffLines };

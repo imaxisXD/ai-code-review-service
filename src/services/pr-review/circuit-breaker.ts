@@ -15,8 +15,8 @@ export class CircuitBreaker {
       isOpen: false,
       failureCount: 0,
       lastFailureTime: 0,
-      resetTimeoutMs: 60000, // 1 minute
-      maxFailures: 3, // Open circuit after 3 consecutive overload failures
+      resetTimeoutMs: 300000, // 5 minutes for rate limit recovery
+      maxFailures: 2, // Open circuit after 2 consecutive rate limit failures
     };
   }
 
@@ -91,7 +91,11 @@ export class CircuitBreaker {
     return (
       errorMessage.includes('overload') ||
       errorMessage.includes('529') ||
-      errorMessage.includes('rate limit')
+      errorMessage.includes('rate limit') ||
+      errorMessage.includes('exceed the rate limit') ||
+      errorMessage.includes('tokens per minute') ||
+      errorMessage.includes('too many requests') ||
+      errorMessage.includes('quota exceeded')
     );
   }
 }

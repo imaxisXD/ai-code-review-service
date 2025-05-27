@@ -24,13 +24,13 @@ export const DEFAULT_CONFIG: ReviewConfig = {
   ],
   embeddingConfig: {
     model: 'text-embedding-3-small',
-    maxInputLength: 8000,
-    similarCodeLimit: 5,
+    maxInputLength: 6000,
+    similarCodeLimit: 3,
   },
   retryConfig: {
-    maxRetries: 1, // Enable retries for LLM analysis - Pub/Sub will handle job-level retries
-    baseDelayMs: 2000,
-    maxDelayMs: 30000,
+    maxRetries: 3, // Increase retries for rate limit handling
+    baseDelayMs: 5000, // Start with 5 seconds
+    maxDelayMs: 60000, // Max 1 minute delay
     enableJitter: true,
   },
   lineNumberValidation: {

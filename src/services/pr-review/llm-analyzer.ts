@@ -161,6 +161,14 @@ export async function analyzeCodeWithLLM(
         filePath: file.path,
         summary: result.object.summary,
         issuesCount: result.object.issues.length,
+        // Log token usage if available
+        usage: result.usage
+          ? {
+              promptTokens: result.usage.promptTokens,
+              completionTokens: result.usage.completionTokens,
+              totalTokens: result.usage.totalTokens,
+            }
+          : 'usage not available',
         issues: result.object.issues.map((issue) => ({
           line: issue.line,
           severity: issue.severity,
@@ -205,13 +213,17 @@ export async function analyzeCodeWithLLM(
       // Calculate exponential backoff delay with optional jitter
       const exponentialDelay = Math.min(BASE_DELAY * Math.pow(2, attempt - 1), MAX_DELAY);
       const jitter = config.retryConfig.enableJitter ? Math.random() * 1000 : 0;
-      const delay = exponentialDelay + jitter;
+
+      // Add extra delay for rate limit errors
+      const rateLimitDelay = isOverloadError ? 30000 : 0; // Extra 30 seconds for rate limits
+      const delay = exponentialDelay + jitter + rateLimitDelay;
 
       logger.info('Retrying LLM analysis with backoff', {
         attempt,
         nextAttempt: attempt + 1,
         delayMs: Math.round(delay),
         isOverloadError,
+        rateLimitDelay: rateLimitDelay,
       });
 
       // Wait before retrying
