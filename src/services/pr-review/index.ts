@@ -38,6 +38,7 @@ import { extractChangedFilesFromGitHub, postCommentsToGitHub } from './github-in
  * - Comment deduplication and validation
  * - Structured LLM analysis with retry logic
  * - Comprehensive file processing and diff analysis
+ * - Persistent job deduplication using Convex DB
  */
 
 export function createPullRequestReviewService(deps: {
@@ -50,10 +51,6 @@ export function createPullRequestReviewService(deps: {
 
   // Circuit breaker for handling API overload
   const circuitBreaker = new CircuitBreaker();
-
-  // Job deduplication cache to prevent processing the same job multiple times
-  const processedJobs = new Map<string, { timestamp: number; result: any }>();
-  const JOB_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
 
   /**
    * Process a pull request review job
@@ -77,16 +74,47 @@ export function createPullRequestReviewService(deps: {
     // Create unique job identifier for deduplication
     const jobId = `${repoId}-${prNumber}-${commitSha}`;
 
-    // Check if this job was recently processed
-    const now = Date.now();
-    const cachedResult = processedJobs.get(jobId);
-    if (cachedResult && now - cachedResult.timestamp < JOB_CACHE_TTL) {
-      logger.info('Job already processed recently, returning cached result', {
+    // Check if this job was recently processed using Convex DB
+    logger.info('Checking job deduplication in Convex DB', {
+      jobId,
+      repoId,
+      prNumber,
+      commitSha: commitSha.substring(0, 7),
+    });
+
+    try {
+      const cachedJob = await convex.query(api.jobs.checkJobDeduplication, {
         jobId,
-        cachedTimestamp: new Date(cachedResult.timestamp).toISOString(),
-        ageMinutes: Math.round((now - cachedResult.timestamp) / 60000),
       });
-      return cachedResult.result;
+
+      if (cachedJob) {
+        const ageMinutes = Math.round((Date.now() - cachedJob.processedAt) / 60000);
+        logger.info('Job already processed recently, returning cached result', {
+          jobId,
+          cachedTimestamp: new Date(cachedJob.processedAt).toISOString(),
+          ageMinutes,
+          cacheHit: true,
+          resultStatus: cachedJob.status,
+          commentsPosted: cachedJob.commentsPosted,
+        });
+
+        return {
+          status: cachedJob.status,
+          reviewId: cachedJob.reviewId,
+          commentsPosted: cachedJob.commentsPosted || 0,
+          error: cachedJob.error,
+        };
+      }
+
+      logger.info('No cached result found, processing new job', {
+        jobId,
+        cacheMiss: 'not_found',
+      });
+    } catch (error) {
+      logger.warn('Failed to check job deduplication, proceeding with job', {
+        jobId,
+        error: error instanceof Error ? error.message : String(error),
+      });
     }
 
     let cloneDir = '';
@@ -215,17 +243,18 @@ export function createPullRequestReviewService(deps: {
       };
 
       // Cache successful result to prevent reprocessing
-      processedJobs.set(jobId, {
-        timestamp: now,
-        result,
+      await convex.mutation(api.jobs.storeJobResult, {
+        jobId,
+        status: result.status,
+        reviewId: result.reviewId,
+        commentsPosted: result.commentsPosted,
       });
 
-      // Clean up old cache entries
-      for (const [key, value] of processedJobs.entries()) {
-        if (now - value.timestamp > JOB_CACHE_TTL) {
-          processedJobs.delete(key);
-        }
-      }
+      logger.info('Job result cached for deduplication', {
+        jobId,
+        result: result.status,
+        commentsPosted: result.commentsPosted,
+      });
 
       return result;
     } catch (error) {
@@ -234,10 +263,27 @@ export function createPullRequestReviewService(deps: {
         error: error instanceof Error ? error.message : String(error),
       });
 
-      return {
-        status: 'Failed',
+      const failedResult = {
+        status: 'Failed' as const,
         error: error instanceof Error ? error.message : String(error),
       };
+
+      // Cache failed result with shorter TTL to prevent immediate retries
+      // but allow retry after some time in case it was a temporary issue
+      await convex.mutation(api.jobs.storeJobResult, {
+        jobId,
+        status: failedResult.status,
+        error: failedResult.error,
+        ttlMinutes: 2, // 2 minutes for failed jobs
+      });
+
+      logger.info('Failed job result cached with shorter TTL', {
+        jobId,
+        failedJobTTLMinutes: 2,
+        error: failedResult.error,
+      });
+
+      return failedResult;
     } finally {
       // Clean up
       if (cloneDir) {

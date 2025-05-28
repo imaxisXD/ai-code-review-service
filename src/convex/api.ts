@@ -1,8 +1,9 @@
+/* eslint-disable @typescript-eslint/no-empty-object-type */
 import { FunctionReference, anyApi } from 'convex/server';
 import { GenericId as Id } from 'convex/values';
 
 export const api: PublicApiType = anyApi as unknown as PublicApiType;
-// export const internal: InternalApiType = anyApi as unknown as InternalApiType;
+export const internal: InternalApiType = anyApi as unknown as InternalApiType;
 
 export type PublicApiType = {
   repositories: {
@@ -151,6 +152,7 @@ export type PublicApiType = {
   };
   users: {
     getUser: FunctionReference<'query', 'public', { clerkId: string }, any>;
+    getUserById: FunctionReference<'query', 'public', { userId: Id<'users'> }, any>;
     store: FunctionReference<'mutation', 'public', Record<string, never>, any>;
     updateUser: FunctionReference<
       'mutation',
@@ -273,6 +275,19 @@ export type PublicApiType = {
       { repositoryId: Id<'repositories'> },
       { message: string; success: boolean }
     >;
+    storeJobResult: FunctionReference<
+      'mutation',
+      'public',
+      {
+        commentsPosted?: number;
+        error?: string;
+        jobId: string;
+        reviewId?: string;
+        status: 'Success' | 'Failed';
+        ttlMinutes?: number;
+      },
+      Id<'jobDeduplication'>
+    >;
   };
   llm: {
     searchCode: FunctionReference<
@@ -299,5 +314,69 @@ export type PublicApiType = {
       any
     >;
   };
+  syncuserdatatosocialprovider: {
+    getUserDetailsFromGitHub: FunctionReference<'action', 'public', { userId: Id<'users'> }, null>;
+  };
+  installations: {
+    getInstallation: FunctionReference<
+      'query',
+      'public',
+      { installationId: number },
+      {
+        _creationTime: number;
+        _id: Id<'installations'>;
+        accountId: number;
+        accountLogin: string;
+        accountType: 'User' | 'Organization';
+        appId: number;
+        createdAt: number;
+        events: Array<string>;
+        installationId: number;
+        permissions: any;
+        targetType: 'User' | 'Organization';
+        updatedAt: number;
+      } | null
+    >;
+  };
+  jobs: {
+    checkJobDeduplication: FunctionReference<
+      'query',
+      'public',
+      { jobId: string },
+      {
+        _id: Id<'jobDeduplication'>;
+        commentsPosted?: number;
+        commitSha: string;
+        error?: string;
+        expiresAt: number;
+        jobId: string;
+        jobType: 'pr_review' | 'indexing';
+        prNumber?: number;
+        processedAt: number;
+        repositoryId: string;
+        result: any;
+        reviewId?: string;
+        status: 'Success' | 'Failed';
+      } | null
+    >;
+    storeJobResult: FunctionReference<
+      'mutation',
+      'public',
+      {
+        commentsPosted?: number;
+        commitSha?: string;
+        error?: string;
+        jobId: string;
+        jobType?: 'pr_review' | 'indexing';
+        prNumber?: number;
+        repositoryId?: string;
+        result?: any;
+        reviewId?: string;
+        status: 'Success' | 'Failed';
+        ttlMinutes?: number;
+      },
+      Id<'jobDeduplication'>
+    >;
+  };
 };
-// export type InternalApiType = {};
+export type InternalApiType = {};
